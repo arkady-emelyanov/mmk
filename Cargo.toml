@@ -1,0 +1,26 @@
+[package]
+name = "mmk"
+version = "0.1.0"
+edition = "2024"
+description = "Mac-style keyboard remapper for Apple keyboards on Linux"
+
+[dependencies]
+libc = "0.2"
+x11rb = "0.14"
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+lexopt = "0.3"
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# ksni serves the tray item at /StatusNotifierItem. Cinnamon's tray (xapp-sn-watcher) only
+# opens the menu on left click for items under /org/ayatana/NotificationItem/, so mmk uses a
+# copy patched to serve and register at that path (vendor/ksni, two lines changed).
+[patch.crates-io]
+ksni = { path = "vendor/ksni" }

@@ -1,0 +1,195 @@
+# mmk configuration
+#
+# Rules: "trigger" = "action"
+#   trigger: physical Mac modifiers (cmd, opt, ctrl, shift, fn) + one key, e.g. "cmd-shift-left"
+#   action:  "home"                  single chord, held while the key is held
+#            "shift-home backspace"  sequence of chords, tapped in order
+#            "super"                 modifier-only chord, tapped
+#            "exec:command args"     run a command (sh -c), on press only
+#            "none"                  swallow the key
+# Output modifiers: ctrl, shift, alt, super. Keys: evdev names (a, 1, f12, left, pageup,
+# backspace, grave, leftbrace, ...). A trailing "--" means the minus key ("cmd--").
+#
+# Physical Ctrl and Opt are never remapped unless a rule names them. Cmd is lazy: it
+# emits nothing by itself; Cmd+key without a rule emits the profile's `cmd` translation.
+
+# --- settings ---
+cmd            = "ctrl"                  # what Cmd becomes for keys without a rule
+alt_guard      = "none"                  # key tapped before releasing a lone Alt, e.g. "f19", to stop Opt taps focusing menu bars; "none" = plain Alt taps
+cmd_tap        = "none"                  # action when Cmd is pressed and released alone, e.g. "super" (pass a lone Cmd through as Super)
+cmd_tap_ms     = 250                     # max Cmd hold time that still counts as a tap
+panic          = "esc+backspace+enter"   # physical keys held together: mmk exits and releases the keyboard
+toggle         = "none"                  # trigger that enables/disables remapping, e.g. "cmd-opt-ctrl-k"
+tray           = true                    # show the tray icon
+window_backend = "auto"                  # auto | x11 | none
+grab_wait_ms   = 3000                    # max wait for all keys up before grabbing a keyboard
+open_retry_ms  = 1000                    # how long to retry opening a hotplugged keyboard
+
+# Cmd+Tab: while Cmd stays held, `keys` are sent with `hold` held; releasing Cmd releases it.
+[switcher]
+enter = ["cmd-tab", "cmd-shift-tab", "cmd-grave", "cmd-shift-grave"]
+hold  = "alt"
+keys  = ["tab", "grave", "left", "right", "up", "down", "esc", "enter"]
+
+# Physical key renames, applied before everything else.
+[remap]
+# capslock = "esc"
+
+# --- global rules (all apps; app profiles below override them) ---
+[keys]
+# line / document navigation
+"cmd-left"         = "home"
+"cmd-right"        = "end"
+"cmd-shift-left"   = "shift-home"
+"cmd-shift-right"  = "shift-end"
+"cmd-up"           = "ctrl-home"
+"cmd-down"         = "ctrl-end"
+"cmd-shift-up"     = "ctrl-shift-home"
+"cmd-shift-down"   = "ctrl-shift-end"
+# word / paragraph navigation
+"opt-left"         = "ctrl-left"
+"opt-right"        = "ctrl-right"
+"opt-shift-left"   = "ctrl-shift-left"
+"opt-shift-right"  = "ctrl-shift-right"
+"opt-up"           = "ctrl-up"
+"opt-down"         = "ctrl-down"
+"opt-shift-up"     = "ctrl-shift-up"
+"opt-shift-down"   = "ctrl-shift-down"
+# deleting
+"opt-backspace"    = "ctrl-backspace"
+"opt-delete"       = "ctrl-delete"
+"cmd-backspace"    = "shift-home backspace"
+"cmd-delete"       = "shift-end delete"
+# system
+"cmd-space"        = "super-space"       # keyboard layout switch
+"cmd-q"            = "alt-f4"
+"cmd-ctrl-q"       = "screenlock"
+"cmd-ctrl-f"       = "alt-f10"           # toggle maximize
+"cmd-shift-3"      = "print"
+"cmd-shift-4"      = "shift-print"
+# tabs
+"cmd-shift-leftbrace"  = "ctrl-pageup"
+"cmd-shift-rightbrace" = "ctrl-pagedown"
+"cmd-opt-left"     = "ctrl-pageup"
+"cmd-opt-right"    = "ctrl-pagedown"
+
+# --- app profiles: first match wins; `class` globs match WM_CLASS / app id, case-insensitive ---
+
+[[app]]
+name  = "raw"
+class = ["anydesk", "gnome-boxes", "gnome-connections", "org.gnome.boxes", "org.remmina.remmina",
+         "remmina", "nxplayer.bin", "qemu-system-*", "qemu", "spicy", "virt-manager", "virt-viewer",
+         "remote-viewer", "virtualbox", "virtualbox machine", "xfreerdp", "wfica"]
+raw   = true
+
+[[app]]
+name  = "terminal"
+class = ["alacritty", "com.raggesilver.blackbox", "com.system76.cosmicterm", "contour",
+         "cutefish-terminal", "deepin-terminal", "dev.warp.warp", "eterm", "*ghostty*",
+         "gnome-terminal", "gnome-terminal-server", "guake", "hyper", "io.elementary.terminal",
+         "kitty", "kgx", "konsole", "lxterminal", "mate-terminal", "mateterminal",
+         "org.codeberg.dnkl.foot*", "foot", "org.gnome.console", "org.gnome.terminal",
+         "org.kde.konsole", "org.kde.yakuake", "org.wezfurlong.wezterm", "*ptyxis*", "roxterm",
+         "qterminal", "st", "st-256color", "sakura", "station", "tabby", "terminator",
+         "terminology", "termite", "termius", "tilda", "tilix", "urxvt", "wave", "wezterm",
+         "wezterm-gui", "xfce4-terminal", "xterm", "yakuake"]
+cmd   = "ctrl-shift"
+[app.keys]
+"opt-left"      = "alt-b"
+"opt-right"     = "alt-f"
+"opt-backspace" = "alt-backspace"
+"opt-delete"    = "alt-d"
+"cmd-backspace" = "ctrl-u"
+"cmd-delete"    = "ctrl-k"
+"cmd-k"         = "ctrl-l"
+"cmd-dot"       = "ctrl-c"
+"cmd-up"        = "ctrl-shift-home"
+"cmd-down"      = "ctrl-shift-end"
+"cmd-1" = "alt-1"
+"cmd-2" = "alt-2"
+"cmd-3" = "alt-3"
+"cmd-4" = "alt-4"
+"cmd-5" = "alt-5"
+"cmd-6" = "alt-6"
+"cmd-7" = "alt-7"
+"cmd-8" = "alt-8"
+"cmd-9" = "alt-9"
+
+# VS Code: its editor and integrated terminal can't be told apart from outside, and on Linux
+# some keystrokes mean different things in each. Known gaps in the terminal panel:
+#   Opt+Shift+Left/Right (Ctrl+Shift+Left/Right) resizes the terminal pane instead of
+#   selecting words; Cmd+Backspace doesn't delete to line start (use Ctrl+U).
+# Copy/paste in the terminal panel: Cmd+Shift+C / Cmd+Shift+V.
+[[app]]
+name  = "vscode"
+class = ["code", "com.microsoft.vscode*", "code - oss", "code-oss", "cursor", "vscodium", "windsurf"]
+[app.keys]
+"cmd-opt-up"   = "ctrl-shift-up"
+"cmd-opt-down" = "ctrl-shift-down"
+
+[[app]]
+name  = "jetbrains"
+class = ["jetbrains-*"]
+[app.keys]
+"cmd-c"         = "ctrl-insert"
+"cmd-v"         = "shift-insert"
+"cmd-x"         = "shift-delete"
+"cmd-backspace" = "ctrl-y"
+"cmd-o"         = "ctrl-n"
+"cmd-shift-o"   = "ctrl-shift-n"
+"cmd-opt-o"     = "ctrl-alt-shift-n"
+"cmd-comma"     = "ctrl-alt-s"
+"cmd-semicolon" = "ctrl-alt-shift-s"
+"cmd-0" = "alt-0"
+"cmd-1" = "alt-1"
+"cmd-2" = "alt-2"
+"cmd-3" = "alt-3"
+"cmd-4" = "alt-4"
+"cmd-5" = "alt-5"
+"cmd-6" = "alt-6"
+"cmd-7" = "alt-7"
+"cmd-8" = "alt-8"
+"cmd-9" = "alt-9"
+"opt-up"        = "ctrl-w"
+"opt-down"      = "ctrl-shift-w"
+"cmd-leftbrace"  = "ctrl-alt-left"
+"cmd-rightbrace" = "ctrl-alt-right"
+"cmd-opt-left"   = "ctrl-alt-left"
+"cmd-opt-right"  = "ctrl-alt-right"
+"cmd-shift-leftbrace"  = "alt-left"
+"cmd-shift-rightbrace" = "alt-right"
+"cmd-shift-up"   = "ctrl-shift-up"
+"cmd-shift-down" = "ctrl-shift-down"
+"cmd-w"         = "ctrl-f4"
+"cmd-g"         = "f3"
+"cmd-shift-g"   = "shift-f3"
+"cmd-l"         = "ctrl-g"
+"cmd-n"         = "alt-insert"
+
+[[app]]
+name  = "browser"
+class = ["brave-browser", "chromium", "chromium-browser", "falkon", "google-chrome",
+         "*ungoogled_chromium", "microsoft-edge*", "org.deepin.browser", "org.kde.falkon",
+         "vivaldi*", "firedragon", "firefox", "firefox-esr", "firefox developer edition",
+         "firefoxdeveloperedition", "firefox-nightly*", "floorp", "librewolf", "mullvad browser",
+         "navigator", "org.mozilla.firefox", "waterfox", "zen*"]
+[app.keys]
+"cmd-leftbrace"  = "alt-left"
+"cmd-rightbrace" = "alt-right"
+"cmd-opt-i"      = "ctrl-shift-i"
+"cmd-opt-j"      = "ctrl-shift-j"
+"cmd-y"          = "ctrl-h"
+
+[[app]]
+name  = "files"
+class = ["caja", "com.system76.cosmicfiles", "dde-file-manager", "dolphin", "io.elementary.files",
+         "krusader", "nautilus", "nemo", "org.gnome.nautilus", "org.kde.dolphin", "org.kde.krusader",
+         "pcmanfm", "pcmanfm-qt", "peony-qt", "spacefm", "thunar"]
+[app.keys]
+"cmd-up"         = "alt-up"
+"cmd-down"       = "enter"
+"cmd-backspace"  = "delete"
+"cmd-i"          = "alt-enter"
+"cmd-shift-dot"  = "ctrl-h"
+"cmd-leftbrace"  = "alt-left"
+"cmd-rightbrace" = "alt-right"
