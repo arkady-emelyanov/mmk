@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml/badge.svg)](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml)
 
-Mac-style shortcuts for Apple keyboards on Linux. A single static binary that runs as your user: Cmd+C/V/T/W, Cmd+←/→, Opt+←/→, Cmd+Tab and friends behave like on macOS in every app, with per-app adjustments for terminals, VS Code, JetBrains IDEs, browsers and file managers. Physical Ctrl and Opt are never remapped, and no other program's configuration is touched.
+Make Linux feel like macOS on an Apple keyboard, so switching between the two is seamless: your Mac shortcuts just work, in every app.
 
 ## Install
 
