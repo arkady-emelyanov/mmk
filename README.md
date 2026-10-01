@@ -4,6 +4,16 @@
 
 Make Linux feel like macOS on an Apple keyboard, so switching between the two is seamless: your Mac shortcuts just work, in every app.
 
+## Supported desktops
+
+| Desktop | Status |
+|---|---|
+| Cinnamon (Linux Mint), X11 | Tested, the default config targets it |
+| MATE, Xfce, KDE Plasma, GNOME on X11 | Should work, untested. A few system shortcuts depend on the desktop's own bindings (Cmd+Space → Super+Space, Cmd+Ctrl+F → Alt+F10, Cmd+Shift+3/4 → Print). GNOME needs the AppIndicator extension for the tray icon. |
+| Any Wayland session | Remapping works, but per-app profiles don't yet: every app gets the global profile. |
+
+mmk reads the keyboard below the display server (evdev/uinput), so remapping doesn't depend on the desktop. Only the per-app profiles (X11 window focus) and the tray icon (StatusNotifierItem) do.
+
 ## Install
 
 Download the static binary for your machine from the [latest release](https://github.com/arkady-emelyanov/mmk/releases/latest) and run its installer:
@@ -50,6 +60,51 @@ The step is skipped if you already have access. That happens, for example, when 
 - Tray icon: enable/disable, current profile, reload, open config, quit.
 - Emergency exit: hold **Esc + Backspace + Enter**.
 - Log: `~/.local/state/mmk/mmk.log`.
+
+## Configure
+
+The config lives in `~/.config/mmk/config.toml` and reloads on save; if it has an error, mmk keeps the previous config and logs why. `mmk check` validates it without running. The file written by `mmk install` (or `mmk init`) is the full default config with comments, so start from it: settings you leave out fall back to their defaults, but `[keys]` and `[[app]]` sections are not merged with the defaults. The file defines all rules and profiles.
+
+Rules map a physical trigger to an action:
+
+```toml
+[keys]
+"cmd-left"      = "home"                  # single chord, held while the key is held
+"cmd-backspace" = "shift-home backspace"  # sequence of chords, tapped in order
+"cmd-shift-k"   = "exec:notify-send hi"   # run a command on press
+"cmd-h"         = "none"                  # swallow the key
+```
+
+Triggers use the Mac modifiers `cmd`, `opt`, `ctrl`, `shift` and `fn`; actions use `ctrl`, `shift`, `alt` and `super`. Keys use evdev names (`a`, `1`, `f12`, `left`, `pageup`, `backspace`, `grave`, `leftbrace`, `comma`, `dot`, …). Cmd+key without a rule becomes Ctrl+key (the `cmd` setting).
+
+App profiles override the global rules for matching windows. The first profile whose `class` matches wins:
+
+```toml
+[[app]]
+name  = "terminal"
+class = ["kitty", "org.gnome.terminal", "*ghostty*"]  # globs, case-insensitive
+cmd   = "ctrl-shift"         # Cmd+key without a rule becomes Ctrl+Shift+key here
+[app.keys]
+"opt-left" = "alt-b"
+
+[[app]]
+name  = "raw"
+class = ["virt-manager"]
+raw   = true                 # pass keys through untouched (VMs, remote desktops)
+```
+
+### Finding an app's WM_CLASS
+
+Focus the app while `mmk focus` is running. It prints each focused window's class and instance, and the profile it gets:
+
+```
+$ mmk focus
+backend: x11  (Ctrl+C to stop)
+app_id="kitty" instance="kitty" -> profile terminal
+app_id="FreeCAD" instance="freecad" -> profile global
+```
+
+A `class` glob matches either value. Without mmk you can run `xprop WM_CLASS` and click the window; it prints `WM_CLASS(STRING) = "instance", "Class"`. Focus tracking works on X11 only, so on Wayland every app gets the global profile.
 
 ## Known limitations
 
