@@ -524,6 +524,13 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cmd_k_is_ctrl_k() {
+        let mut t = T::new("gnome-terminal-server");
+        assert_eq!(t.feed("+leftmeta +k -k -leftmeta"), "+leftctrl +k -k -leftctrl");
+        t.assert_clean();
+    }
+
+    #[test]
     fn physical_ctrl_untouched() {
         let mut t = T::new("");
         assert_eq!(t.feed("+leftctrl"), "+leftctrl");
