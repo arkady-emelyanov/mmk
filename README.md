@@ -9,7 +9,7 @@ Make Linux feel like macOS on an Apple keyboard, so switching between the two is
 | Desktop | Status |
 |---|---|
 | Cinnamon (Linux Mint), X11 | Tested, the default config targets it |
-| MATE, Xfce, KDE Plasma, GNOME on X11 | Should work, untested. A few system shortcuts depend on the desktop's own bindings (Cmd+Space → Super+Space, Cmd+Ctrl+F → Alt+F10, Cmd+Shift+3/4 → Print). GNOME needs the AppIndicator extension for the tray icon. |
+| MATE, Xfce, KDE Plasma, GNOME on X11 | Should work, untested. A few system shortcuts depend on the desktop's own bindings (`Cmd+Space` → `Super+Space`, `Cmd+Ctrl+F` → `Alt+F10`, `Cmd+Shift+3/4` → `Print`). GNOME needs the AppIndicator extension for the tray icon. |
 | Any Wayland session | Remapping works, but per-app profiles don't yet: every app gets the global profile. |
 
 mmk reads the keyboard below the display server (evdev/uinput), so remapping doesn't depend on the desktop. Only the per-app profiles (X11 window focus) and the tray icon (StatusNotifierItem) do.
@@ -58,7 +58,7 @@ The step is skipped if you already have access. That happens, for example, when 
 - `mmk doctor` checks permissions, keyboards, focus tracking and conflicts.
 - `mmk focus` shows which profile the focused app gets.
 - Tray icon: enable/disable, current profile, reload, open config, quit.
-- Emergency exit: hold **Esc + Backspace + Enter**.
+- Emergency exit: hold `Esc+Backspace+Enter`.
 - Log: `~/.local/state/mmk/mmk.log`.
 
 ## Configure
@@ -75,7 +75,7 @@ Rules map a physical trigger to an action:
 "cmd-h"         = "none"                  # swallow the key
 ```
 
-Triggers use the Mac modifiers `cmd`, `opt`, `ctrl`, `shift` and `fn`; actions use `ctrl`, `shift`, `alt` and `super`. Keys use evdev names (`a`, `1`, `f12`, `left`, `pageup`, `backspace`, `grave`, `leftbrace`, `comma`, `dot`, …). Cmd+key without a rule becomes Ctrl+key (the `cmd` setting).
+Triggers use the Mac modifiers `cmd`, `opt`, `ctrl`, `shift` and `fn`; actions use `ctrl`, `shift`, `alt` and `super`. Keys use evdev names (`a`, `1`, `f12`, `left`, `pageup`, `backspace`, `grave`, `leftbrace`, `comma`, `dot`, …). `Cmd+key` without a rule becomes `Ctrl+key` (the `cmd` setting).
 
 App profiles override the global rules for matching windows. The first profile whose `class` matches wins:
 
@@ -108,8 +108,8 @@ A `class` glob matches either value. Without mmk you can run `xprop WM_CLASS` an
 
 ## Known limitations
 
-- VS Code's integrated terminal: mmk can't tell it apart from the editor, and VS Code on Linux uses some keystrokes differently there. Opt+Shift+←/→ resizes the terminal pane (it selects words in the editor), Cmd+Backspace doesn't delete to line start (use Ctrl+U), and copy/paste is Cmd+Shift+C / Cmd+Shift+V.
-- Cmd+click is a plain click (Cmd is only translated together with a key); physical Ctrl+click works as usual.
+- VS Code's integrated terminal: mmk can't tell it apart from the editor, and VS Code on Linux uses some keystrokes differently there. `Opt+Shift+←/→` resizes the terminal pane (it selects words in the editor), `Cmd+Backspace` doesn't delete to line start (use `Ctrl+U`), and copy/paste is `Cmd+Shift+C` / `Cmd+Shift+V`.
+- `Cmd+click` is a plain click (Cmd is only translated together with a key); physical `Ctrl+click` works as usual.
 - Focus tracking (per-app profiles) works on X11. On Wayland sessions every app gets the global profile for now.
 
 ## Develop
