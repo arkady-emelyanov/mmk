@@ -52,6 +52,7 @@ options:
   --log FILE          append log output to FILE
   --device PATH       only use this input device (testing)
   -y, --yes           answer yes to install prompts
+  -V, --version       print the version
   -h, --help          show this help
 ";
 
@@ -85,6 +86,10 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("device") => a.device = Some(p.value()?.into()),
             Long("purge") => a.purge = true,
             Short('y') | Long("yes") => a.yes = true,
+            Short('V') | Long("version") => {
+                println!("mmk {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             Short('h') | Long("help") => {
                 print!("{USAGE}");
                 std::process::exit(0);

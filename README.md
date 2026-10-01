@@ -1,8 +1,20 @@
 # mmk
 
+[![CI](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml/badge.svg)](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml)
+
 Mac-style shortcuts for Apple keyboards on Linux. A single static binary that runs as your user: Cmd+C/V/T/W, Cmd+←/→, Opt+←/→, Cmd+Tab and friends behave like on macOS in every app, with per-app adjustments for terminals, VS Code, JetBrains IDEs, browsers and file managers. Physical Ctrl and Opt are never remapped, and no other program's configuration is touched.
 
 ## Install
+
+Download the static binary for your machine from the [latest release](https://github.com/arkady-emelyanov/mmk/releases/latest) and run its installer:
+
+```
+curl -Lo /tmp/mmk https://github.com/arkady-emelyanov/mmk/releases/latest/download/mmk-$(uname -m)-linux
+chmod +x /tmp/mmk
+/tmp/mmk install
+```
+
+Builds are available for `x86_64` and `aarch64`; each has a `.sha256` file next to it. To build from source instead:
 
 ```
 cargo build --release --target x86_64-unknown-linux-musl

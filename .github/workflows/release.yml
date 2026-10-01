@@ -1,0 +1,50 @@
+name: Release
+
+# Builds static binaries for a published GitHub release and attaches them to it.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload to (e.g. v1.0.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: mmk-x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: mmk-aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --locked
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Check the binary is static and reports the release version
+        run: |
+          bin=target/${{ matrix.target }}/release/mmk
+          file "$bin" | grep -q 'statically linked\|static-pie linked'
+          test "$("$bin" --version)" = "mmk ${TAG#v}"
+          cp "$bin" ${{ matrix.asset }}
+          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" ${{ matrix.asset }} ${{ matrix.asset }}.sha256 --clobber
