@@ -254,7 +254,7 @@ fn refresh_icon_cache(root: &std::path::Path) {
 fn symbolic_svg(state: State) -> String {
     // Same proportions as the pixmap: ⌘ square half-side, loop radius and stroke, relative
     // to the circle's radius.
-    let r = 6.75_f32;
+    let r = 8.0_f32;
     let (a, lr, stroke) = (0.194 * r, 0.194 * r, 2.0 * 0.0764 * r);
     let e = a + lr;
     let (cx, cy) = (8.0_f32, 8.0_f32);
@@ -299,7 +299,7 @@ fn symbolic_svg(state: State) -> String {
 fn cmd_icon(size: i32, rgb: [u8; 3], alpha: f32) -> ksni::Icon {
     // Circle radius as a fraction of half the icon: leaves the same padding as the panel's
     // symbolic icons (e.g. volume), so it doesn't look oversized next to them.
-    const RADIUS: f32 = 0.72;
+    const RADIUS: f32 = 0.75;
     // ⌘ proportions (see in_command_symbol), in units of the icon's half-size.
     const A: f32 = 0.14;
     const R: f32 = 0.14;
