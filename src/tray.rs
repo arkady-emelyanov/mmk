@@ -15,12 +15,21 @@ pub struct Tray {
     pub keyboards: Vec<String>,
     pub error: Option<String>,
     pub config_path: PathBuf,
+    /// Whether to offer the named symbolic icon (false: pixmap only, see `spawn`).
+    named_icon: bool,
     tx: Sender<Msg>,
 }
 
 pub type Handle = ksni::blocking::Handle<Tray>;
 
 pub fn spawn(tx: Sender<Msg>, config_path: PathBuf) -> Option<Handle> {
+    let fresh = match install_icons() {
+        Ok(changed) => changed,
+        Err(e) => {
+            eprintln!("mmk: tray icons: {e}");
+            false
+        }
+    };
     let t = Tray {
         enabled: true,
         profile: "global".into(),
@@ -28,13 +37,44 @@ pub fn spawn(tx: Sender<Msg>, config_path: PathBuf) -> Option<Handle> {
         keyboards: Vec::new(),
         error: None,
         config_path,
+        // Panels notice new icon files only after their next periodic rescan; until then
+        // show the pixmap, then switch to the named icon so the panel looks it up again.
+        named_icon: !fresh,
         tx,
     };
     match t.spawn() {
-        Ok(h) => Some(h),
+        Ok(h) => {
+            if fresh {
+                let h2 = h.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                    h2.update(|t| t.named_icon = true);
+                });
+            }
+            Some(h)
+        }
         Err(e) => {
             eprintln!("mmk: no tray: {e}");
             None
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Active,
+    Disabled,
+    Warning,
+}
+
+impl Tray {
+    fn state(&self) -> State {
+        if self.error.is_some() || self.keyboards.is_empty() {
+            State::Warning
+        } else if self.enabled {
+            State::Active
+        } else {
+            State::Disabled
         }
     }
 }
@@ -51,13 +91,17 @@ impl ksni::Tray for Tray {
     /// Left click opens the menu too, same as right click.
     const MENU_ON_ACTIVATE: bool = true;
 
+    /// A symbolic icon by name: panels size it like their other symbolic icons (e.g. volume)
+    /// and tint it with the panel's text colour. The pixmap below is the fallback.
+    fn icon_name(&self) -> String {
+        if self.named_icon { icon_name(self.state()).into() } else { String::new() }
+    }
+
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        let (rgb, alpha) = if self.error.is_some() || self.keyboards.is_empty() {
-            ([0xf0, 0x9a, 0x2a], 1.0) // problem: amber
-        } else if self.enabled {
-            ([0xe8, 0xe8, 0xe8], 1.0)
-        } else {
-            ([0x80, 0x80, 0x80], 0.6) // disabled: dim grey
+        let (rgb, alpha) = match self.state() {
+            State::Warning => ([0xf0, 0x9a, 0x2a], 1.0), // amber
+            State::Active => ([0xe8, 0xe8, 0xe8], 1.0),
+            State::Disabled => ([0x80, 0x80, 0x80], 0.6), // dim grey
         };
         [16, 22, 24, 32, 48, 64].iter().map(|s| cmd_icon(*s, rgb, alpha)).collect()
     }
@@ -141,6 +185,115 @@ impl ksni::Tray for Tray {
     }
 }
 
+/// Tilt of the ⌘ in the tray icon, counter-clockwise.
+const TILT_DEG: f32 = 25.0;
+
+fn icon_name(state: State) -> &'static str {
+    match state {
+        State::Active => "mmk-active-symbolic",
+        State::Disabled => "mmk-disabled-symbolic",
+        State::Warning => "mmk-warning-symbolic",
+    }
+}
+
+fn icon_dir() -> PathBuf {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| crate::config::home().join(".local/share"));
+    data.join("icons/hicolor")
+}
+
+/// Write the symbolic tray icons into the user's icon theme (only when they changed) and
+/// refresh its cache, so panels can find them by name. Returns whether anything changed.
+pub fn install_icons() -> std::io::Result<bool> {
+    let root = icon_dir();
+    let dir = root.join("scalable/status");
+    std::fs::create_dir_all(&dir)?;
+    let mut changed = false;
+    for state in [State::Active, State::Disabled, State::Warning] {
+        let path = dir.join(format!("{}.svg", icon_name(state)));
+        let svg = symbolic_svg(state);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(svg.as_str()) {
+            std::fs::write(&path, svg)?;
+            changed = true;
+        }
+    }
+    if changed {
+        refresh_icon_cache(&root);
+    }
+    Ok(changed)
+}
+
+pub fn remove_icons() {
+    let root = icon_dir();
+    for state in [State::Active, State::Disabled, State::Warning] {
+        let _ = std::fs::remove_file(root.join(format!("scalable/status/{}.svg", icon_name(state))));
+    }
+    refresh_icon_cache(&root);
+}
+
+/// A stale icon-theme.cache would hide new icons: rebuild it if one exists.
+fn refresh_icon_cache(root: &std::path::Path) {
+    if root.join("icon-theme.cache").exists() {
+        let ok = std::process::Command::new("gtk-update-icon-cache")
+            .args(["-q", "-f", "-t"])
+            .arg(root)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            // No tool: drop the cache so the theme directory is scanned instead.
+            let _ = std::fs::remove_file(root.join("icon-theme.cache"));
+        }
+    }
+}
+
+/// The tray icon as a 16x16 symbolic SVG: a circle with the ⌘ cut out. `#bebebe` and the
+/// `warning` class are the symbolic-icon conventions panels recolour. The cut-out uses a
+/// mask drawn with polygon/line/polyline, which symbolic recolouring leaves alone.
+fn symbolic_svg(state: State) -> String {
+    // Same proportions as the pixmap: ⌘ square half-side, loop radius and stroke, relative
+    // to the circle's radius.
+    let r = 6.75_f32;
+    let (a, lr, stroke) = (0.194 * r, 0.194 * r, 2.0 * 0.0764 * r);
+    let e = a + lr;
+    let (cx, cy) = (8.0_f32, 8.0_f32);
+    let mut glyph = String::new();
+    for (x1, y1, x2, y2) in [(-a, -e, -a, e), (a, -e, a, e), (-e, -a, e, -a), (-e, a, e, a)] {
+        glyph += &format!(
+            "<line x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\"/>",
+            cx + x1, cy + y1, cx + x2, cy + y2
+        );
+    }
+    for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        // Each loop leaves out the quarter facing the centre.
+        let base = (-sy).atan2(-sx);
+        let pts: Vec<String> = (0..=27)
+            .map(|i| {
+                let t = base + std::f32::consts::FRAC_PI_4 + i as f32 / 27.0 * 1.5 * std::f32::consts::PI;
+                format!("{:.3},{:.3}", cx + sx * e + lr * t.cos(), cy + sy * e + lr * t.sin())
+            })
+            .collect();
+        glyph += &format!("<polyline points=\"{}\"/>", pts.join(" "));
+    }
+    let (class, opacity) = match state {
+        State::Active => ("", ""),
+        State::Disabled => ("", " opacity=\"0.45\""),
+        State::Warning => (" class=\"warning\"", ""),
+    };
+    let fill = if state == State::Warning { "#f57900" } else { "#bebebe" };
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\">\
+<mask id=\"cut\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"16\" height=\"16\">\
+<polygon points=\"0,0 16,0 16,16 0,16\" fill=\"#fff\"/>\
+<g transform=\"rotate({tilt} {cx} {cy})\" fill=\"none\" stroke=\"#000\" stroke-width=\"{stroke:.3}\">{glyph}</g>\
+</mask>\
+<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"{fill}\"{class}{opacity} mask=\"url(#cut)\"/>\
+</svg>\n",
+        tilt = -TILT_DEG,
+    )
+}
+
 /// A filled circle with the Command symbol (⌘) cut out, tilted left, ARGB32 (network byte
 /// order). Drawn in code with 4x4 supersampling so the edges are smooth at any size.
 fn cmd_icon(size: i32, rgb: [u8; 3], alpha: f32) -> ksni::Icon {
@@ -152,8 +305,6 @@ fn cmd_icon(size: i32, rgb: [u8; 3], alpha: f32) -> ksni::Icon {
     const R: f32 = 0.14;
     const HALF_STROKE: f32 = 0.055;
     const SS: i32 = 4;
-    // Tilt of the ⌘, counter-clockwise.
-    const TILT_DEG: f32 = 25.0;
     let (sin, cos) = TILT_DEG.to_radians().sin_cos();
     let mut data = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
@@ -213,6 +364,18 @@ mod tests {
                 let i = super::cmd_icon(s, rgb, a);
                 std::fs::write(format!("{dir}/{name}-{s}.argb"), &i.data).unwrap();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod svg_tests {
+    #[test]
+    #[ignore]
+    fn dump_svgs() {
+        let dir = std::env::var("ICON_DUMP_DIR").unwrap();
+        for s in [super::State::Active, super::State::Disabled, super::State::Warning] {
+            std::fs::write(format!("{dir}/{}.svg", super::icon_name(s)), super::symbolic_svg(s)).unwrap();
         }
     }
 }

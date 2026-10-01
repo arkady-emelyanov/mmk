@@ -272,6 +272,7 @@ pub fn uninstall(purge: bool) -> i32 {
             println!("[remove] {}", p.display());
         }
     }
+    crate::tray::remove_icons();
     if Path::new(UDEV_RULE).exists() || Path::new(MODULES_LOAD).exists() {
         println!("[permissions] removing {UDEV_RULE} and {MODULES_LOAD} (needs root)");
         if run_privileged(&format!("rm -f {UDEV_RULE} {MODULES_LOAD}; udevadm control --reload-rules")) {
