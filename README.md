@@ -1,4 +1,4 @@
-# mmk <sub>my magic keyboard</sub>
+# mmk
 
 [![CI](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml/badge.svg)](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml)
 
