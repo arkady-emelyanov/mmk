@@ -15,6 +15,7 @@ pub const KEY_RIGHTMETA: u16 = 126;
 pub const KEY_FN: u16 = 0x1d0;
 pub const KEY_A: u16 = 30;
 pub const KEY_SPACE: u16 = 57;
+pub const KEY_U: u16 = 22;
 
 /// Every key code treated as a modifier.
 pub const MOD_KEYS: [u16; 9] = [

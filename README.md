@@ -61,6 +61,31 @@ The step is skipped if you already have access. That happens, for example, when 
 - Emergency exit: hold `Esc+Backspace+Enter`.
 - Log: `~/.local/state/mmk/mmk.log`.
 
+## Typography
+
+`Opt` types the same typographic characters as on a Mac (US layout), in every app:
+
+| Shortcut | Character |
+|---|---|
+| `Opt+-` / `Opt+Shift+-` | – en dash / — em dash |
+| `Opt+;` | … ellipsis |
+| `Opt+[` / `Opt+Shift+[` | “ ” double quotes |
+| `Opt+]` / `Opt+Shift+]` | ‘ ’ single quotes, apostrophe |
+| `Opt+\` / `Opt+Shift+\` | « » guillemets |
+| `Opt+Space` | non-breaking space |
+| `Opt+8` / `Opt+Shift+9` / `Opt+Shift+8` | • bullet / · middle dot / ° degree |
+| `Opt+6` / `Opt+7` / `Opt+T` | § section / ¶ paragraph / † dagger |
+| `Opt+G` / `Opt+R` / `Opt+2` | © / ® / ™ |
+| `Opt+Shift+2` / `Opt+3` / `Opt+4` / `Opt+Y` | € / £ / ¢ / ¥ |
+| `Opt+=` / `Opt+Shift+=` | ≠ / ± |
+| `Opt+,` / `Opt+.` | ≤ / ≥ |
+| `Opt+/` / `Opt+X` / `Opt+5` | ÷ / ≈ / ∞ |
+| `Opt+P` / `Opt+V` / `Opt+B` / `Opt+Z` / `Opt+M` | π / √ / ∫ / Ω / µ |
+
+In terminals `Opt+.` stays `Alt+.` (readline: insert the last argument). These are ordinary `text:` rules in the config, so you can change them or add your own.
+
+How it works: a virtual keyboard can only send key codes, so on X11 mmk borrows keycodes that have no meaning in your keymap (most keymaps have a dozen or two) and maps the characters onto them, two per keycode. Only the running X server's in-memory keymap changes, never a config file; mmk restores the mapping if the desktop resets the keymap, and clears it when it exits. If a config has more characters than free keycodes, the rest are mapped as they're typed. On Wayland mmk types them as `Ctrl+Shift+U`, the hex code, `Space`, which works in GTK apps and with IBus.
+
 ## Configure
 
 The config lives in `~/.config/mmk/config.toml` and reloads on save; if it has an error, mmk keeps the previous config and logs why. `mmk check` validates it without running. The file written by `mmk install` (or `mmk init`) is the full default config with comments, so start from it: settings you leave out fall back to their defaults, but `[keys]` and `[[app]]` sections are not merged with the defaults. The file defines all rules and profiles.
@@ -72,6 +97,7 @@ Rules map a physical trigger to an action:
 "cmd-left"      = "home"                  # single chord, held while the key is held
 "cmd-backspace" = "shift-home backspace"  # sequence of chords, tapped in order
 "cmd-shift-k"   = "exec:notify-send hi"   # run a command on press
+"opt-shift--"   = "text:—"                # type characters (see Typography)
 "cmd-h"         = "none"                  # swallow the key
 ```
 
@@ -109,6 +135,7 @@ A `class` glob matches either value. Without mmk you can run `xprop WM_CLASS` an
 ## Known limitations
 
 - VS Code's integrated terminal: mmk can't tell it apart from the editor, and VS Code on Linux uses some keystrokes differently there. `Opt+Shift+←/→` resizes the terminal pane (it selects words in the editor), `Cmd+Backspace` doesn't delete to line start (use `Ctrl+U`), and copy/paste is `Cmd+Shift+C` / `Cmd+Shift+V`.
+- `Opt+letter` and `Opt+digit` shortcuts that type a character (see Typography) no longer reach apps as `Alt+letter`/`Alt+digit`, so menu accelerators on those keys don't work with `Opt`. Delete the rule from the config to get `Alt` back for a key.
 - `Cmd+click` is a plain click (Cmd is only translated together with a key); physical `Ctrl+click` works as usual.
 - Focus tracking (per-app profiles) works on X11. On Wayland sessions every app gets the global profile for now.
 

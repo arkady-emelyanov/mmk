@@ -12,6 +12,16 @@ pub trait Sink {
     fn key(&mut self, code: u16, value: i32);
 }
 
+/// Makes characters typeable that the keyboard layout lacks (see typist.rs).
+pub trait Typist: Send {
+    /// Map `chars` ahead of use; called on every config load.
+    fn prepare(&mut self, chars: &[char]);
+    /// The key to tap for `c`, and whether Shift must be held. `None`: not typeable this way.
+    fn key(&mut self, c: char) -> Option<(u16, bool)>;
+    /// The keymap changed under us: put the characters back.
+    fn refresh(&mut self);
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Continue,
@@ -41,6 +51,7 @@ pub struct Engine {
     cmd_down_at: Option<Instant>,
     cmd_alone: bool,
     pub exec: Box<dyn FnMut(&str) + Send>,
+    typist: Option<Box<dyn Typist>>,
     pub verbose: bool,
 }
 
@@ -60,6 +71,7 @@ impl Engine {
             cmd_down_at: None,
             cmd_alone: false,
             exec: Box::new(|_| {}),
+            typist: None,
             verbose: false,
         }
     }
@@ -84,7 +96,21 @@ impl Engine {
         self.focus = key;
     }
 
+    pub fn set_typist(&mut self, mut t: Box<dyn Typist>) {
+        t.prepare(&self.cfg.text_chars());
+        self.typist = Some(t);
+    }
+
+    pub fn keymap_changed(&mut self) {
+        if let Some(t) = &mut self.typist {
+            t.refresh();
+        }
+    }
+
     pub fn set_config(&mut self, cfg: Arc<Config>) {
+        if let Some(t) = &mut self.typist {
+            t.prepare(&cfg.text_chars());
+        }
         self.cfg = cfg;
         self.cache.clear();
         let (a, i) = std::mem::take(&mut self.focus);
@@ -288,7 +314,7 @@ impl Engine {
                         self.press(out, ch.key);
                         self.active[c] = Some(Active::Key(ch.key));
                     }
-                    Action::Tap(_) => {
+                    Action::Tap(_) | Action::Text(_) => {
                         self.run(out, &action);
                         self.active[c] = Some(Active::Seq(action));
                     }
@@ -345,12 +371,7 @@ impl Engine {
                 for ch in chords {
                     if ch.key != 0 {
                         self.sync(out, &ch.mods, true);
-                        if self.emitted[ch.key as usize] {
-                            self.release(out, ch.key, false);
-                        }
-                        out.key(ch.key, 1);
-                        self.after_press(ch.key);
-                        out.key(ch.key, 0);
+                        self.tap(out, ch.key);
                     } else {
                         // Modifier-only tap, e.g. "super": a deliberate lone modifier, unguarded.
                         self.sync(out, &ch.mods, false);
@@ -360,9 +381,52 @@ impl Engine {
                     }
                 }
             }
+            Action::Text(text) => {
+                // Text goes out without modifiers. Releasing a bare Alt (Opt held alone) would
+                // be a lone Alt tap that focuses menu bars, so press Ctrl first to cover it,
+                // unless alt_guard does that.
+                if self.cfg.alt_guard.is_none() && self.alt_bare() {
+                    self.press(out, KEY_LEFTCTRL);
+                }
+                for c in text.chars() {
+                    match self.typist.as_mut().and_then(|t| t.key(c)) {
+                        Some((code, shift)) => {
+                            self.sync(out, if shift { &[KEY_LEFTSHIFT] } else { &[] }, false);
+                            self.tap(out, code);
+                        }
+                        None => self.type_hex(out, c),
+                    }
+                }
+                self.sync(out, &[], false);
+            }
             Action::Exec(cmd) => (self.exec)(cmd),
             Action::None => {}
         }
+    }
+
+    /// Ctrl+Shift+U, the code point in hex, Space: Unicode input in GTK and IBus.
+    fn type_hex(&mut self, out: &mut dyn Sink, c: char) {
+        self.sync(out, &[KEY_LEFTCTRL, KEY_LEFTSHIFT], false);
+        self.tap(out, KEY_U);
+        self.sync(out, &[], false);
+        for d in format!("{:x}", c as u32).chars() {
+            self.tap(out, lookup_key(d.encode_utf8(&mut [0; 4])).expect("hex digit key"));
+        }
+        self.tap(out, KEY_SPACE);
+    }
+
+    fn tap(&mut self, out: &mut dyn Sink, code: u16) {
+        if self.emitted[code as usize] {
+            self.release(out, code, false);
+        }
+        out.key(code, 1);
+        self.after_press(code);
+        out.key(code, 0);
+    }
+
+    /// An Alt is down on the output with no other key pressed since.
+    fn alt_bare(&self) -> bool {
+        [KEY_LEFTALT, KEY_RIGHTALT].iter().enumerate().any(|(i, a)| self.emitted[*a as usize] && self.bare[i])
     }
 
     /// Make the emitted modifiers exactly `desired`.
@@ -583,9 +647,9 @@ mod tests {
     #[test]
     fn lifted_alt_not_restored_then_needed() {
         let mut t = T::new("");
-        // Opt+Left lifts Alt; a following Opt+x passthrough re-presses Alt just before x.
-        let s = t.feed("+leftalt +left -left +x -x -leftalt");
-        assert_eq!(s, "+leftalt +leftctrl -leftalt +left -left +leftalt -leftctrl +x -x -leftalt");
+        // Opt+Left lifts Alt; a following Opt+e passthrough re-presses Alt just before x.
+        let s = t.feed("+leftalt +left -left +e -e -leftalt");
+        assert_eq!(s, "+leftalt +leftctrl -leftalt +left -left +leftalt -leftctrl +e -e -leftalt");
         t.assert_clean();
         t.assert_no_lone_alt();
     }
@@ -712,6 +776,44 @@ mod tests {
         assert_eq!(t.feed("+leftmeta +c -c -leftmeta"), "+leftctrl +c -c -leftctrl");
         assert_eq!(t.feed("+leftmeta +leftshift -leftshift -leftmeta"), "+leftshift -leftshift");
         t.assert_clean();
+    }
+
+    /// Maps characters to keys like the X11 typist: one per level of keys f13, f14, ...
+    struct FakeTypist(Vec<char>);
+
+    impl Typist for FakeTypist {
+        fn prepare(&mut self, chars: &[char]) {
+            self.0 = chars.to_vec();
+        }
+        fn key(&mut self, c: char) -> Option<(u16, bool)> {
+            let i = self.0.iter().position(|x| *x == c)?;
+            Some((lookup_key("f13").unwrap() + i as u16 / 2, i % 2 == 1))
+        }
+        fn refresh(&mut self) {}
+    }
+
+    #[test]
+    fn text_through_typist() {
+        let mut t = T::with("[keys]\n\"opt--\" = \"text:–\"\n\"opt-shift--\" = \"text:—\"\n", "");
+        t.e.set_typist(Box::new(FakeTypist(Vec::new())));
+        // text:– and text:— sort to f13 (plain) and f13 with Shift
+        assert_eq!(t.feed("+leftalt +minus"), "+leftalt +leftctrl -leftctrl -leftalt +f13 -f13");
+        assert_eq!(t.feed("=minus -minus"), "+f13 -f13");
+        assert_eq!(t.feed("+leftshift +minus -minus -leftshift -leftalt"), "+leftshift +f13 -f13 -leftshift");
+        // Alt pressed last is bare even with Shift down
+        let s = t.feed("+leftshift +leftalt +minus -minus -leftalt -leftshift");
+        assert_eq!(s, "+leftshift +leftalt +leftctrl -leftctrl -leftalt +f13 -f13 -leftshift");
+        t.assert_clean();
+        t.assert_no_lone_alt();
+    }
+
+    #[test]
+    fn text_without_typist_uses_unicode_input() {
+        let mut t = T::with("[keys]\n\"opt-shift--\" = \"text:—\"\n", "");
+        let s = t.feed("+leftshift +leftalt +minus -minus -leftalt -leftshift");
+        assert_eq!(s, "+leftshift +leftalt +leftctrl -leftalt +u -u -leftctrl -leftshift +2 -2 +0 -0 +1 -1 +4 -4 +space -space");
+        t.assert_clean();
+        t.assert_no_lone_alt();
     }
 
     #[test]

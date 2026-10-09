@@ -6,6 +6,7 @@
 #            "shift-home backspace"  sequence of chords, tapped in order
 #            "super"                 modifier-only chord, tapped
 #            "exec:command args"     run a command (sh -c), on press only
+#            "text:—"                type characters, e.g. ones the layout doesn't have
 #            "none"                  swallow the key
 # Output modifiers: ctrl, shift, alt, super. Keys: evdev names (a, 1, f12, left, pageup,
 # backspace, grave, leftbrace, ...). A trailing "--" means the minus key ("cmd--").
@@ -72,6 +73,43 @@ keys  = ["tab", "grave", "left", "right", "up", "down", "esc", "enter"]
 "cmd-shift-rightbrace" = "ctrl-pagedown"
 "cmd-opt-left"     = "ctrl-pageup"
 "cmd-opt-right"    = "ctrl-pagedown"
+# typography, as on a Mac (US layout). On X11 the characters are mapped onto spare
+# keycodes of the live keymap; on Wayland they are typed as Ctrl+Shift+U + hex code.
+"opt--"                = "text:–"        # en dash
+"opt-shift--"          = "text:—"        # em dash
+"opt-semicolon"        = "text:…"        # ellipsis
+"opt-leftbrace"        = "text:“"
+"opt-shift-leftbrace"  = "text:”"
+"opt-rightbrace"       = "text:‘"
+"opt-shift-rightbrace" = "text:’"
+"opt-backslash"        = "text:«"
+"opt-shift-backslash"  = "text:»"
+"opt-space"            = "text:\u00A0"   # non-breaking space
+"opt-8"                = "text:•"        # bullet
+"opt-shift-9"          = "text:·"        # middle dot
+"opt-shift-8"          = "text:°"        # degree
+"opt-6"                = "text:§"
+"opt-7"                = "text:¶"
+"opt-t"                = "text:†"
+"opt-g"                = "text:©"
+"opt-r"                = "text:®"
+"opt-2"                = "text:™"
+"opt-shift-2"          = "text:€"
+"opt-3"                = "text:£"
+"opt-4"                = "text:¢"
+"opt-y"                = "text:¥"
+"opt-equal"            = "text:≠"
+"opt-shift-equal"      = "text:±"
+"opt-comma"            = "text:≤"
+"opt-dot"              = "text:≥"
+"opt-slash"            = "text:÷"
+"opt-x"                = "text:≈"
+"opt-5"                = "text:∞"
+"opt-p"                = "text:π"
+"opt-v"                = "text:√"
+"opt-b"                = "text:∫"
+"opt-z"                = "text:Ω"
+"opt-m"                = "text:µ"
 
 # --- app profiles: first match wins; `class` globs match WM_CLASS / app id, case-insensitive ---
 
@@ -103,6 +141,7 @@ cmd   = "ctrl-shift"
 "cmd-delete"    = "ctrl-k"
 "cmd-k"         = "ctrl-k"
 "cmd-dot"       = "ctrl-c"
+"opt-dot"       = "alt-dot"                # readline: last argument (not ≥)
 "cmd-up"        = "ctrl-shift-home"
 "cmd-down"      = "ctrl-shift-end"
 "cmd-1" = "alt-1"

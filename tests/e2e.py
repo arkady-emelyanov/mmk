@@ -19,7 +19,7 @@ EVIOCGRAB = IOC(1, 'E', 0x90, 4)
 EV_SYN, EV_KEY = 0, 1
 
 KEYS = {"esc": 1, "backspace": 14, "tab": 15, "q": 16, "t": 20, "u": 22, "enter": 28, "leftctrl": 29,
-        "a": 30, "c": 46, "v": 47, "grave": 41, "leftshift": 42, "leftalt": 56, "space": 57,
+        "a": 30, "c": 46, "minus": 12, "2": 3, "0": 11, "1": 2, "4": 5, "v": 47, "grave": 41, "leftshift": 42, "leftalt": 56, "space": 57,
         "home": 102, "left": 105, "right": 106, "end": 107, "f4": 62, "f19": 189,
         "leftmeta": 125, "rightmeta": 126, "rightctrl": 97}
 NAMES = {v: k for k, v in KEYS.items()}
@@ -83,6 +83,20 @@ def read_output(fd, quiet=0.15):
                 out.append(("-+="[v]) + NAMES.get(c, f"key{c}"))
     return " ".join(out)
 
+def text_key(ch):
+    """Where the live X keymap put `ch` for text: rules: (evdev key name, needs Shift), or
+    None without X (mmk then types Ctrl+Shift+U hex input)."""
+    if not os.environ.get("DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return None
+    sym = f"U{ord(ch):04X}"
+    for line in subprocess.run(["xmodmap", "-pke"], capture_output=True, text=True).stdout.splitlines():
+        kc, _, syms = line.partition("=")
+        syms = syms.split()[:2]
+        if sym in syms:
+            code = int(kc.split()[1]) - 8
+            return NAMES.get(code, f"key{code}"), syms[0] != sym
+    raise RuntimeError(f"{ch!r} ({sym}) is not in the X keymap")
+
 def main():
     cfg = open(os.path.join(HERE, "..", "src", "default.toml")).read()
     cfg = cfg.replace('tray           = true', 'tray           = false')
@@ -140,6 +154,15 @@ def main():
              "+leftalt +tab -tab +right -right +tab -tab -leftalt")
         case("cmd+space layout switch", "+leftmeta +space -space -leftmeta", "+leftmeta +space -space -leftmeta")
         case("cmd+q -> alt+f4", "+leftmeta +q -q -leftmeta", "+leftalt +f4 -f4 -leftalt")
+        # Opt+Shift+- -> em dash; Ctrl covers the release of the Alt pressed last
+        dash = text_key("—")
+        if dash is None:
+            expected = "+leftshift +leftalt +leftctrl -leftalt +u -u -leftctrl -leftshift +2 -2 +0 -0 +1 -1 +4 -4 +space -space"
+        elif dash[1]:
+            expected = f"+leftshift +leftalt +leftctrl -leftctrl -leftalt +{dash[0]} -{dash[0]} -leftshift"
+        else:
+            expected = f"+leftshift +leftalt +leftctrl -leftctrl -leftshift -leftalt +{dash[0]} -{dash[0]}"
+        case("opt+shift+- -> em dash", "+leftshift +leftalt +minus -minus -leftalt -leftshift", expected)
         case("held key repeats", "+leftmeta +left =left =left -left -leftmeta", "+home =home =home -home")
 
         # latency: fake key press -> mmk output event

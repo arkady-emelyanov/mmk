@@ -6,6 +6,7 @@ mod install;
 mod keys;
 mod sys;
 mod tray;
+mod typist;
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -28,6 +29,8 @@ pub enum Msg {
     Led(u16, i32),
     Reload,
     SetEnabled(bool),
+    /// The X keymap changed (a keyboard appeared, the layout was reloaded).
+    Keymap,
     Quit,
 }
 
@@ -182,6 +185,15 @@ fn run(args: &Args) -> i32 {
     let mut engine = Engine::new(cfg.clone());
     engine.verbose = args.verbose;
     engine.exec = Box::new(spawn_detached);
+    if let Some(t) = typist::select() {
+        // Watch first: the desktop typically re-applies the layout when our virtual keyboard
+        // appears, wiping the characters mapped just below.
+        let w = tx.clone();
+        typist::watch(move || {
+            let _ = w.send(Msg::Keymap);
+        });
+        engine.set_typist(t);
+    }
     let mut app = String::new();
     let mut error: Option<String> = None;
 
@@ -256,6 +268,7 @@ fn run(args: &Args) -> i32 {
                 eprintln!("mmk: remapping {}", if on { "enabled" } else { "disabled" });
                 update_tray(&engine, &app, &error);
             }
+            Msg::Keymap => engine.keymap_changed(),
             Msg::Quit => break,
         }
     }

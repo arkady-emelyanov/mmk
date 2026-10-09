@@ -24,9 +24,18 @@ pub enum Action {
     Tap(Vec<Chord>),
     /// Shell command, run on press.
     Exec(String),
+    /// Characters typed as text, e.g. an em dash.
+    Text(String),
 }
 
 pub fn parse_action(s: &str) -> Result<Action, String> {
+    // Before trimming: the text may itself be whitespace, e.g. a non-breaking space.
+    if let Some(text) = s.trim_start().strip_prefix("text:") {
+        if text.is_empty() {
+            return Err(format!("{s:?}: no text after \"text:\""));
+        }
+        return Ok(Action::Text(text.to_string()));
+    }
     let s = s.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("none") {
         return Ok(Action::None);
@@ -270,6 +279,18 @@ fn parse_mods(s: &str) -> Result<Vec<u16>, String> {
 }
 
 impl Config {
+    /// Every character a `text:` action can type, for preparing the keymap.
+    pub fn text_chars(&self) -> Vec<char> {
+        let mut set = std::collections::BTreeSet::new();
+        let profiles = std::iter::once(&self.base).chain(&self.apps);
+        for a in profiles.flat_map(|p| p.rules.values()).chain(&self.cmd_tap) {
+            if let Action::Text(t) = &**a {
+                set.extend(t.chars());
+            }
+        }
+        set.into_iter().collect()
+    }
+
     /// Profile for a focused app. `app_id` is the Wayland app id or X11 WM_CLASS class;
     /// `instance` the X11 WM_CLASS instance (may be empty).
     pub fn match_app(&self, app_id: &str, instance: &str) -> Arc<Profile> {
@@ -338,6 +359,16 @@ mod tests {
         assert!(e.contains("cmd-left") && e.contains("hom"), "{e}");
         let e = parse("bogus = 1\n").unwrap_err();
         assert!(e.contains("bogus"), "{e}");
+    }
+
+    #[test]
+    fn text_actions() {
+        assert!(matches!(parse_action("text:\u{a0}").unwrap(), Action::Text(t) if t == "\u{a0}"));
+        assert!(matches!(parse_action(" text:—").unwrap(), Action::Text(t) if t == "—"));
+        assert!(parse_action("text:").is_err());
+        let c = parse(DEFAULT_CONFIG).unwrap();
+        let chars = c.text_chars();
+        assert!(chars.contains(&'—') && chars.contains(&'\u{a0}'));
     }
 
     #[test]
