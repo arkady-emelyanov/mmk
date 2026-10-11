@@ -110,6 +110,7 @@ App profiles override the global rules for matching windows. The first profile w
 name  = "terminal"
 class = ["kitty", "org.gnome.terminal", "*ghostty*"]  # globs, case-insensitive
 cmd   = "ctrl-shift"         # Cmd+key without a rule becomes Ctrl+Shift+key here
+us_keys = true               # rule outputs like alt-b type their US character in any layout
 [app.keys]
 "opt-left" = "alt-b"
 
@@ -118,6 +119,10 @@ name  = "raw"
 class = ["virt-manager"]
 raw   = true                 # pass keys through untouched (VMs, remote desktops)
 ```
+
+### Non-Latin layouts
+
+A rule sends key positions, and the active layout decides what they type: with a Russian layout active, the terminal's `Opt+←` = `alt-b` arrives as `Alt+и`, which readline ignores. With `us_keys = true` (on for the default terminal profile; set it at the top for every app), letters, digits and punctuation in rule outputs type their US character whatever the layout, through a spare keycode as in Typography. Keys that type the same in all your layouts are sent as they are. Other apps don't need it: they match `Ctrl`/`Alt` shortcuts by key position. Works on X11 only.
 
 ### Finding an app's WM_CLASS
 

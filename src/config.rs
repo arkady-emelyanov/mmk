@@ -58,6 +58,9 @@ pub struct Profile {
     pub raw: bool,
     /// What a held Cmd emits for keys without a rule (left-side keys).
     pub cmd: Vec<u16>,
+    /// Letters, digits and punctuation in rule outputs type their US character whatever the
+    /// active layout.
+    pub us_keys: bool,
     /// Trigger id -> action; global rules already merged in.
     pub rules: HashMap<u32, Arc<Action>>,
 }
@@ -103,6 +106,7 @@ struct RawApp {
     #[serde(default)]
     raw: bool,
     cmd: Option<String>,
+    us_keys: Option<bool>,
     #[serde(default)]
     keys: HashMap<String, String>,
 }
@@ -111,6 +115,7 @@ struct RawApp {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     cmd: Option<String>,
+    us_keys: Option<bool>,
     alt_guard: Option<String>,
     cmd_tap: Option<String>,
     cmd_tap_ms: Option<u64>,
@@ -163,6 +168,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
 
     // Settings: user value, else the default config's value.
     let cmd = user.cmd.or(def.cmd).expect("default: cmd");
+    let us_keys = user.us_keys.or(def.us_keys).expect("default: us_keys");
     let alt_guard = user.alt_guard.or(def.alt_guard).expect("default: alt_guard");
     let cmd_tap = user.cmd_tap.or(def.cmd_tap).expect("default: cmd_tap");
     let cmd_tap_ms = user.cmd_tap_ms.or(def.cmd_tap_ms).expect("default: cmd_tap_ms");
@@ -219,6 +225,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
         globs: Vec::new(),
         raw: false,
         cmd: parse_mods(&cmd).map_err(|e| format!("cmd: {e}"))?,
+        us_keys,
         rules: base_rules.clone(),
     });
 
@@ -235,6 +242,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
             globs: a.class.iter().map(|c| c.to_lowercase()).collect(),
             raw: a.raw,
             cmd,
+            us_keys: a.us_keys.unwrap_or(us_keys),
             rules,
         }));
     }
@@ -343,6 +351,9 @@ mod tests {
         assert_eq!(c.base.cmd, vec![KEY_LEFTCTRL]);
         assert!(c.apps.iter().any(|a| a.name == "terminal"));
         assert_eq!(c.alt_guard, None);
+        assert!(!c.base.us_keys);
+        assert!(c.apps.iter().find(|a| a.name == "terminal").unwrap().us_keys);
+        assert!(!c.apps.iter().find(|a| a.name == "browser").unwrap().us_keys);
     }
 
     #[test]

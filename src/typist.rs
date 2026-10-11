@@ -16,6 +16,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::engine::Typist;
+use crate::keys::us_char;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -74,6 +75,8 @@ pub struct X11Typist {
     tick: u64,
     /// A MappingNotify arrived: check our keycodes before the next use.
     stale: bool,
+    /// Evdev codes of US character keys that type something else in some layout group.
+    varies: Vec<u16>,
 }
 
 impl X11Typist {
@@ -87,7 +90,7 @@ impl X11Typist {
         for kc in prev.value32().into_iter().flatten().filter_map(|kc| u8::try_from(kc).ok()) {
             conn.change_keyboard_mapping(1, kc, 2, &[NO_SYMBOL; 2])?;
         }
-        Ok(X11Typist { conn, root, prop, slots: Vec::new(), wanted: Vec::new(), tick: 0, stale: false })
+        Ok(X11Typist { conn, root, prop, slots: Vec::new(), wanted: Vec::new(), tick: 0, stale: false, varies: Vec::new() })
     }
 
     /// Re-read the keymap: drop borrowed keycodes something else took, borrow newly free
@@ -100,6 +103,16 @@ impl X11Typist {
         let modmap = self.conn.get_modifier_mapping()?.reply()?.keycodes;
         let per = map.keysyms_per_keycode as usize;
         let syms = |kc: u8| &map.keysyms[(kc - min) as usize * per..][..per];
+
+        // The core keymap lists every group's keysyms for a key: a key types its US character
+        // in every layout if nothing but that character (and its Shift pair) appears.
+        self.varies = (min.max(9)..=max)
+            .map(|kc| kc as u16 - 8)
+            .filter(|&code| {
+                let us = [false, true].map(|shift| us_char(code, shift).map_or(NO_SYMBOL, keysym));
+                us[0] != NO_SYMBOL && syms((code + 8) as u8).iter().any(|k| *k != NO_SYMBOL && !us.contains(k))
+            })
+            .collect();
 
         self.slots.retain_mut(|s| {
             let cur = syms(s.keycode);
@@ -204,6 +217,17 @@ impl X11Typist {
         self.refresh()
     }
 
+    fn try_layout_proof(&mut self, key: u16, c: char) -> Result<Option<(u16, bool)>, BoxError> {
+        self.drain_events()?;
+        if self.stale {
+            self.refresh()?;
+        }
+        if !self.varies.contains(&key) {
+            return Ok(None);
+        }
+        self.try_key(c)
+    }
+
     fn try_key(&mut self, c: char) -> Result<Option<(u16, bool)>, BoxError> {
         self.drain_events()?;
         if self.stale {
@@ -240,6 +264,13 @@ impl Typist for X11Typist {
     fn key(&mut self, c: char) -> Option<(u16, bool)> {
         self.try_key(c).unwrap_or_else(|e| {
             eprintln!("mmk: typing {c:?}: {e}");
+            None
+        })
+    }
+
+    fn layout_proof(&mut self, key: u16, c: char) -> Option<(u16, bool)> {
+        self.try_layout_proof(key, c).unwrap_or_else(|e| {
+            eprintln!("mmk: typing {c:?} layout-independently: {e}");
             None
         })
     }
@@ -332,6 +363,27 @@ mod tests {
         for kc in codes {
             let map = conn.get_keyboard_mapping(kc, 1).unwrap().reply().unwrap();
             assert!(map.keysyms.iter().all(|k| *k == NO_SYMBOL), "keycode {kc} left mapped: {:x?}", map.keysyms);
+        }
+    }
+
+    /// Against the running X server: keys that type other characters in some layout group
+    /// get a borrowed keycode with their US character, the rest none.
+    /// `cargo test -- --ignored x11_layout_proof`
+    #[test]
+    #[ignore]
+    fn x11_layout_proof() {
+        let mut t = X11Typist::connect().unwrap();
+        t.prepare(&[]);
+        eprintln!("vary across layouts: {:?}", t.varies.iter().map(|k| crate::keys::key_name(*k)).collect::<Vec<_>>());
+        for code in 2..=53 {
+            let Some(c) = us_char(code, false) else { continue };
+            match t.layout_proof(code, c) {
+                None => assert!(!t.varies.contains(&code), "{c}"),
+                Some((key, shift)) => {
+                    let map = t.conn.get_keyboard_mapping((key + 8) as u8, 1).unwrap().reply().unwrap();
+                    assert_eq!(map.keysyms[shift as usize], keysym(c), "{c}");
+                }
+            }
         }
     }
 }

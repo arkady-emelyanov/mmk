@@ -16,6 +16,7 @@
 
 # --- settings ---
 cmd            = "ctrl"                  # what Cmd becomes for keys without a rule
+us_keys        = false                   # letters, digits and punctuation in rule outputs type their US character in any layout (X11)
 alt_guard      = "none"                  # key tapped before releasing a lone Alt, e.g. "f19", to stop Opt taps focusing menu bars; "none" = plain Alt taps
 cmd_tap        = "none"                  # action when Cmd is pressed and released alone, e.g. "super" (pass a lone Cmd through as Super)
 cmd_tap_ms     = 250                     # max Cmd hold time that still counts as a tap
@@ -132,6 +133,7 @@ class = ["alacritty", "com.raggesilver.blackbox", "com.system76.cosmicterm", "co
          "terminology", "termite", "termius", "tilda", "tilix", "urxvt", "wave", "wezterm",
          "wezterm-gui", "xfce4-terminal", "xterm", "yakuake"]
 cmd   = "ctrl-shift"
+us_keys = true                           # Alt+B stays Alt+B (readline) when a Russian, Greek, ... layout is active
 [app.keys]
 "opt-left"      = "alt-b"
 "opt-right"     = "alt-f"

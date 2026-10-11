@@ -18,6 +18,9 @@ pub trait Typist: Send {
     fn prepare(&mut self, chars: &[char]);
     /// The key to tap for `c`, and whether Shift must be held. `None`: not typeable this way.
     fn key(&mut self, c: char) -> Option<(u16, bool)>;
+    /// The key to tap for `c`, typed on a US layout by `key`, so that it types `c` in every
+    /// layout. `None`: `key` itself does (it types the same in every layout), or no key can.
+    fn layout_proof(&mut self, key: u16, c: char) -> Option<(u16, bool)>;
     /// The keymap changed under us: put the characters back.
     fn refresh(&mut self);
 }
@@ -310,6 +313,8 @@ impl Engine {
                 }
                 match &*action {
                     Action::Hold(ch) => {
+                        let proof = self.layout_proof(ch);
+                        let ch = proof.as_ref().unwrap_or(ch);
                         self.sync(out, &ch.mods, true);
                         self.press(out, ch.key);
                         self.active[c] = Some(Active::Key(ch.key));
@@ -362,6 +367,8 @@ impl Engine {
     fn run(&mut self, out: &mut dyn Sink, action: &Action) {
         match action {
             Action::Hold(ch) => {
+                let proof = self.layout_proof(ch);
+                let ch = proof.as_ref().unwrap_or(ch);
                 self.sync(out, &ch.mods, true);
                 out.key(ch.key, 1);
                 self.after_press(ch.key);
@@ -370,6 +377,8 @@ impl Engine {
             Action::Tap(chords) => {
                 for ch in chords {
                     if ch.key != 0 {
+                        let proof = self.layout_proof(ch);
+                        let ch = proof.as_ref().unwrap_or(ch);
                         self.sync(out, &ch.mods, true);
                         self.tap(out, ch.key);
                     } else {
@@ -402,6 +411,22 @@ impl Engine {
             Action::Exec(cmd) => (self.exec)(cmd),
             Action::None => {}
         }
+    }
+
+    /// With the profile's `us_keys`, `ch` with its key replaced by one that types the key's US
+    /// character in any layout; `None` to send `ch` as it is.
+    fn layout_proof(&mut self, ch: &Chord) -> Option<Chord> {
+        if !self.profile.us_keys {
+            return None;
+        }
+        let shift = ch.mods.iter().any(|m| class_of(*m) == M_SHIFT);
+        let c = us_char(ch.key, shift)?;
+        let (key, shift) = self.typist.as_mut()?.layout_proof(ch.key, c)?;
+        let mut mods: Vec<u16> = ch.mods.iter().copied().filter(|m| class_of(*m) != M_SHIFT).collect();
+        if shift {
+            mods.push(KEY_LEFTSHIFT);
+        }
+        Some(Chord { mods, key })
     }
 
     /// Ctrl+Shift+U, the code point in hex, Space: Unicode input in GTK and IBus.
@@ -789,6 +814,10 @@ mod tests {
             let i = self.0.iter().position(|x| *x == c)?;
             Some((lookup_key("f13").unwrap() + i as u16 / 2, i % 2 == 1))
         }
+        /// Every letter varies across layouts; lowercase ones go on f20, uppercase on f21.
+        fn layout_proof(&mut self, _key: u16, c: char) -> Option<(u16, bool)> {
+            c.is_ascii_alphabetic().then(|| (lookup_key("f20").unwrap() + c.is_ascii_uppercase() as u16, false))
+        }
         fn refresh(&mut self) {}
     }
 
@@ -805,6 +834,24 @@ mod tests {
         assert_eq!(s, "+leftshift +leftalt +leftctrl -leftctrl -leftalt +f13 -f13 -leftshift");
         t.assert_clean();
         t.assert_no_lone_alt();
+    }
+
+    #[test]
+    fn us_keys_are_layout_proof() {
+        let cfg = "[keys]\n\"opt-left\" = \"alt-b\"\n\"opt-right\" = \"alt-shift-f\"\n\"opt-up\" = \"ctrl-u ctrl-up\"\n\"opt-dot\" = \"alt-dot\"\n";
+        let mut t = T::with(&format!("us_keys = true\n{cfg}"), "");
+        t.e.set_typist(Box::new(FakeTypist(Vec::new())));
+        assert_eq!(t.feed("+leftalt +left =left -left"), "+leftalt +f20 =f20 -f20");
+        assert_eq!(t.feed("+right -right"), "+f21 -f21");
+        assert_eq!(t.feed("+up -up"), "+leftctrl -leftalt +f20 -f20 +up -up");
+        // dot types "." in every layout (per the fake typist): sent as it is
+        assert_eq!(t.feed("+dot -dot -leftalt"), "+leftalt -leftctrl +dot -dot -leftalt");
+        t.assert_clean();
+        t.assert_no_lone_alt();
+        // Off by default
+        let mut t = T::with(cfg, "");
+        t.e.set_typist(Box::new(FakeTypist(Vec::new())));
+        assert_eq!(t.feed("+leftalt +left -left -leftalt"), "+leftalt +b -b -leftalt");
     }
 
     #[test]

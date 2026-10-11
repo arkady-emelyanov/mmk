@@ -122,6 +122,16 @@ pub fn key_name(code: u16) -> String {
         .unwrap_or_else(|| format!("key{code}"))
 }
 
+/// The character `code` types on a US layout, with or without Shift. `None` for keys that
+/// don't type a character, and for Space, which every layout keeps.
+pub fn us_char(code: u16, shift: bool) -> Option<char> {
+    const ROWS: [(u16, &str, &str); 4] =
+        [(2, "1234567890-=", "!@#$%^&*()_+"), (16, "qwertyuiop[]", "QWERTYUIOP{}"), (30, "asdfghjkl;'`", "ASDFGHJKL:\"~"), (43, "\\zxcvbnm,./", "|ZXCVBNM<>?")];
+    let (first, plain, shifted) = ROWS.iter().find(|(f, p, _)| (*f..*f + p.len() as u16).contains(&code))?;
+    let i = (code - first) as usize;
+    (if shift { shifted } else { plain }).chars().nth(i)
+}
+
 fn input_mod(word: &str) -> Option<ModMask> {
     Some(match word {
         "cmd" | "command" | "super" | "meta" | "win" => M_CMD,
@@ -256,5 +266,15 @@ mod tests {
         let s = parse_chord("super").unwrap();
         assert_eq!((s.mods, s.key), (vec![KEY_LEFTMETA], 0));
         assert!(parse_chord("a-ctrl").is_err());
+    }
+
+    #[test]
+    fn us_chars() {
+        let c = |k: &str, shift| us_char(lookup_key(k).unwrap(), shift);
+        assert_eq!((c("1", false), c("equal", true)), (Some('1'), Some('+')));
+        assert_eq!((c("b", false), c("b", true)), (Some('b'), Some('B')));
+        assert_eq!((c("leftbrace", false), c("grave", true), c("apostrophe", false)), (Some('['), Some('~'), Some('\'')));
+        assert_eq!((c("backslash", false), c("dot", false), c("slash", true)), (Some('\\'), Some('.'), Some('?')));
+        assert_eq!((c("enter", false), c("leftshift", false), c("space", false), c("left", false)), (None, None, None, None));
     }
 }
