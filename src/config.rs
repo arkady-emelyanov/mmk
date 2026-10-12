@@ -390,6 +390,7 @@ mod tests {
         assert_eq!(c.match_app("jetbrains-idea", "jetbrains-idea").name, "jetbrains");
         assert_eq!(c.match_app("com.mitchellh.ghostty", "").name, "terminal");
         assert_eq!(c.match_app("Nemo", "nemo").name, "files");
+        assert_eq!(c.match_app("orca", "orca").name, "orca");
         assert_eq!(c.match_app("FreeCAD", "freecad").name, "global");
         assert_eq!(c.match_app("", "").name, "global");
     }

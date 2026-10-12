@@ -168,6 +168,14 @@ class = ["code", "com.microsoft.vscode*", "code - oss", "code-oss", "cursor", "v
 "cmd-opt-up"   = "ctrl-shift-up"
 "cmd-opt-down" = "ctrl-shift-down"
 
+# Orca switches tabs with Ctrl+Shift+[ / ] on Linux; Ctrl+PageUp/PageDown only cycles terminal tabs.
+[[app]]
+name  = "orca"
+class = ["orca", "orca-ide"]
+[app.keys]
+"cmd-shift-leftbrace"  = "ctrl-shift-leftbrace"
+"cmd-shift-rightbrace" = "ctrl-shift-rightbrace"
+
 [[app]]
 name  = "jetbrains"
 class = ["jetbrains-*"]
