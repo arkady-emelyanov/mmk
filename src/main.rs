@@ -3,10 +3,12 @@ mod devices;
 mod engine;
 mod focus;
 mod install;
-mod keys;
+mod search;
 mod sys;
 mod tray;
 mod typist;
+
+pub use mmk_common::keys;
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
-use engine::{Engine, Outcome};
+use engine::{Engine, Outcome, SearchMode, Sink};
 use focus::Focus;
 
 /// Everything the engine thread reacts to. One channel, so a slow producer can
@@ -31,6 +33,19 @@ pub enum Msg {
     SetEnabled(bool),
     /// The X keymap changed (a keyboard appeared, the layout was reloaded).
     Keymap,
+    /// From the search UI (§16.14).
+    SearchShown,
+    SearchFocused,
+    SearchHidden,
+    SearchMode(SearchMode),
+    /// The UI process is gone.
+    SearchGone,
+    /// `hold_ms` passed since the request that started hold N.
+    SearchTimeout(u32),
+    /// For the tray: search unavailable or crashing; `None` when fine.
+    SearchStatus(Option<search::Status>),
+    /// Tray menu: toggle the search window.
+    SearchToggle,
     Quit,
 }
 
@@ -47,7 +62,13 @@ commands:
   check               validate the config
   devices             list detected Apple keyboards
   focus               print the focused app and matched profile as they change
-  doctor              diagnose permissions, devices, focus, conflicts
+  doctor              diagnose permissions, devices, focus, search, conflicts
+  search [TEXT]       toggle the search window (with TEXT: show it with TEXT typed);
+                      starts mmk if it isn't running
+    --terminal [LINE]   open the inline terminal (running LINE)
+    --reindex           rebuild the file index
+    --forget TEXT       drop the usage history for a query
+    --query TEXT        print ranked results without a window
 
 options:
   -c, --config PATH   config file (default: ~/.config/mmk/config.toml)
@@ -61,6 +82,12 @@ options:
 
 struct Args {
     cmd: String,
+    /// Positional arguments after the command.
+    rest: Vec<String>,
+    terminal: bool,
+    reindex: bool,
+    forget: Option<String>,
+    query: Option<String>,
     config: PathBuf,
     verbose: bool,
     log: Option<PathBuf>,
@@ -73,6 +100,11 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
     let mut a = Args {
         cmd: "run".into(),
+        rest: Vec::new(),
+        terminal: false,
+        reindex: false,
+        forget: None,
+        query: None,
         config: config::default_path(),
         verbose: false,
         log: None,
@@ -81,6 +113,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
         yes: false,
     };
     let mut p = lexopt::Parser::from_env();
+    let mut have_cmd = false;
     while let Some(arg) = p.next()? {
         match arg {
             Short('c') | Long("config") => a.config = p.value()?.into(),
@@ -97,7 +130,15 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
-            Value(v) => a.cmd = v.string()?,
+            Long("terminal") => a.terminal = true,
+            Long("reindex") => a.reindex = true,
+            Long("forget") => a.forget = Some(p.value()?.string()?),
+            Long("query") => a.query = Some(p.value()?.string()?),
+            Value(v) if !have_cmd => {
+                a.cmd = v.string()?;
+                have_cmd = true;
+            }
+            Value(v) if a.cmd == "search" => a.rest.push(v.string()?),
             _ => return Err(arg.unexpected()),
         }
     }
@@ -124,12 +165,42 @@ fn main() {
         "devices" => list_devices(),
         "focus" => watch_focus(&args.config),
         "doctor" => install::doctor(&args.config),
+        "search" => search_cmd(&args),
         other => {
             eprintln!("mmk: unknown command {other:?}\n\n{USAGE}");
             2
         }
     };
     std::process::exit(code);
+}
+
+/// `mmk search ...`: a thin client of the running mmk (see search.rs).
+fn search_cmd(a: &Args) -> i32 {
+    use mmk_common::proto::Msg as Line;
+    if let Some(q) = &a.query {
+        return search::query(q, &a.config);
+    }
+    let text = a.rest.join(" ");
+    let req = if a.terminal {
+        let l = Line::new("terminal");
+        if text.is_empty() { l } else { l.arg("line", text) }
+    } else if a.reindex {
+        Line::new("reindex")
+    } else if let Some(f) = &a.forget {
+        Line::new("forget").arg("query", f.as_str())
+    } else if text.is_empty() {
+        Line::new("toggle")
+    } else {
+        Line::new("show").arg("query", text)
+    };
+    search::client(req, &a.config)
+}
+
+/// Where the engine's output goes when remapping is off: nowhere.
+struct NoOutput;
+
+impl Sink for NoOutput {
+    fn key(&mut self, _: u16, _: i32) {}
 }
 
 fn run(args: &Args) -> i32 {
@@ -150,42 +221,68 @@ fn run(args: &Args) -> i32 {
     if !from_file {
         eprintln!("mmk: {} not found, using the built-in default (`mmk init` writes it out)", args.config.display());
     }
+    let mut search_error = cfg.search_error.clone();
+    if let Some(e) = &search_error {
+        eprintln!("mmk: config error, search uses the default settings: {e}");
+    }
+    let remapping = cfg.remapping;
     let cfg = Arc::new(cfg);
 
     // Signals are handled on their own thread; block them before any thread starts.
     let sigs = signal_set();
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &sigs, std::ptr::null_mut()) };
 
-    let mut ui = match sys::Uinput::create() {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("mmk: cannot create the virtual keyboard (/dev/uinput): {e}\n     run `mmk doctor` or `mmk install`");
-            return 1;
+    // Without remapping: no virtual keyboard, no grabbing, no focus tracking; the engine
+    // only ever sees search messages and writes nowhere.
+    let mut ui = if remapping {
+        match sys::Uinput::create() {
+            Ok(u) => Some(u),
+            Err(e) => {
+                eprintln!("mmk: cannot create the virtual keyboard (/dev/uinput): {e}\n     run `mmk doctor` or `mmk install`");
+                return 1;
+            }
         }
+    } else {
+        eprintln!("mmk: remapping = false: search only, keyboards are not grabbed");
+        None
     };
+    let mut no_output = NoOutput;
+    macro_rules! out {
+        () => {
+            match ui.as_mut() {
+                Some(u) => u as &mut dyn Sink,
+                None => &mut no_output as &mut dyn Sink,
+            }
+        };
+    }
 
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_signal_thread(sigs, tx.clone());
-    spawn_led_thread(&ui, tx.clone());
     watch_config(&args.config, tx.clone());
 
-    let mgr = devices::Manager::new(tx.clone(), args.device.clone(), cfg.grab_wait_ms, cfg.open_retry_ms);
-    mgr.start();
+    let mgr = ui.as_ref().map(|ui| {
+        spawn_led_thread(ui, tx.clone());
+        let mgr = devices::Manager::new(tx.clone(), args.device.clone(), cfg.grab_wait_ms, cfg.open_retry_ms);
+        mgr.start();
+        if let Some(backend) = focus::select(&cfg.window_backend) {
+            eprintln!("mmk: focus backend: {}", backend.name());
+            let t = tx.clone();
+            focus::spawn(backend, move |f| {
+                let _ = t.send(Msg::Focus(f));
+            });
+        }
+        mgr
+    });
 
-    if let Some(backend) = focus::select(&cfg.window_backend) {
-        eprintln!("mmk: focus backend: {}", backend.name());
-        let t = tx.clone();
-        focus::spawn(backend, move |f| {
-            let _ = t.send(Msg::Focus(f));
-        });
-    }
-
-    let tray = if cfg.tray { tray::spawn(tx.clone(), args.config.clone()) } else { None };
+    let tray = if cfg.tray { tray::spawn(tx.clone(), args.config.clone(), remapping) } else { None };
+    let search = search::Supervisor::start(tx.clone(), cfg.search.clone(), args.verbose);
 
     let mut engine = Engine::new(cfg.clone());
     engine.verbose = args.verbose;
     engine.exec = Box::new(spawn_detached);
-    if let Some(t) = typist::select() {
+    let s = search.clone();
+    engine.search = Box::new(move |c| s.call(c));
+    if remapping && let Some(t) = typist::select() {
         // Watch first: the desktop typically re-applies the layout when our virtual keyboard
         // appears, wiping the characters mapped just below.
         let w = tx.clone();
@@ -196,61 +293,72 @@ fn run(args: &Args) -> i32 {
     }
     let mut app = String::new();
     let mut error: Option<String> = None;
+    let mut search_status: Option<search::Status> = None;
 
-    let update_tray = |engine: &Engine, app: &str, error: &Option<String>| {
+    let update_tray = |engine: &Engine, app: &str, error: &Option<String>, search_error: &Option<String>, search_status: &Option<search::Status>| {
         if let Some(h) = &tray {
             // Config errors and current device problems; device problems vanish with the device.
             let mut errors: Vec<String> = error.iter().cloned().collect();
-            errors.extend(mgr.errors());
+            errors.extend(search_error.iter().map(|e| format!("Config error (search): {e}")));
+            if let Some(m) = &mgr {
+                errors.extend(m.errors());
+            }
             let error = if errors.is_empty() { None } else { Some(errors.join("\n")) };
-            let (enabled, profile, app, kbds) =
-                (engine.enabled(), engine.profile_name().to_string(), app.to_string(), mgr.names());
+            let (enabled, profile, app) = (engine.enabled(), engine.profile_name().to_string(), app.to_string());
+            let kbds = mgr.as_ref().map(|m| m.names()).unwrap_or_default();
+            let search = search_status.clone();
             h.update(move |t| {
                 t.enabled = enabled;
                 t.profile = profile;
                 t.app = app;
                 t.error = error;
                 t.keyboards = kbds;
+                t.search = search;
             });
         }
     };
+    if search_error.is_some() {
+        update_tray(&engine, &app, &error, &search_error, &search_status);
+    }
 
     for msg in rx {
-        match msg {
-            Msg::Key(code, value) => {
-                let out = engine.handle(&mut ui, code, value);
-                if let Err(e) = ui.flush() {
-                    eprintln!("mmk: write to virtual keyboard: {e}");
-                }
-                match out {
-                    Outcome::Exit => {
-                        eprintln!("mmk: panic chord pressed, exiting");
-                        break;
-                    }
-                    Outcome::Toggled(on) => {
-                        eprintln!("mmk: remapping {}", if on { "enabled" } else { "disabled" });
-                        update_tray(&engine, &app, &error);
-                    }
-                    Outcome::Continue => {}
-                }
-            }
+        let outcome = match msg {
+            Msg::Key(code, value) => engine.handle(out!(), code, value),
             Msg::Focus(f) => {
-                let before = engine.profile_name().to_string();
+                let before = engine.profile_name().as_ptr();
                 engine.set_focus(&f.app_id, &f.instance);
                 app = f.app_id;
-                if before != engine.profile_name() {
-                    update_tray(&engine, &app, &error);
+                if before != engine.profile_name().as_ptr() {
+                    update_tray(&engine, &app, &error, &search_error, &search_status);
                 }
+                Outcome::Continue
             }
-            Msg::Led(code, value) => mgr.set_led(code, value),
-            Msg::DevicesChanged => update_tray(&engine, &app, &error),
+            Msg::Led(code, value) => {
+                if let Some(m) = &mgr {
+                    m.set_led(code, value);
+                }
+                Outcome::Continue
+            }
+            Msg::DevicesChanged => {
+                update_tray(&engine, &app, &error, &search_error, &search_status);
+                Outcome::Continue
+            }
             Msg::DeviceGone => {
-                engine.release_all(&mut ui);
-                let _ = ui.flush();
+                engine.release_all(out!());
+                Outcome::Continue
             }
             Msg::Reload => {
                 match config::load(&args.config) {
-                    Ok((c, _)) => {
+                    Ok((mut c, _)) => {
+                        c.keep_search(engine.config());
+                        if let Some(e) = &c.search_error {
+                            eprintln!("mmk: config error, keeping the previous search settings: {e}");
+                        }
+                        if c.remapping != remapping {
+                            eprintln!("mmk: remapping = {} takes effect when mmk restarts", c.remapping);
+                        }
+                        search.configure(&c.search);
+                        search_error = c.search_error.clone();
                         engine.set_config(Arc::new(c));
                         error = None;
                         eprintln!("mmk: config reloaded");
@@ -260,22 +368,75 @@ fn run(args: &Args) -> i32 {
                         error = Some(format!("Config error: {e}"));
                     }
                 }
-                update_tray(&engine, &app, &error);
+                update_tray(&engine, &app, &error, &search_error, &search_status);
+                Outcome::Continue
             }
             Msg::SetEnabled(on) => {
-                engine.set_enabled(&mut ui, on);
-                let _ = ui.flush();
+                engine.set_enabled(out!(), on);
                 eprintln!("mmk: remapping {}", if on { "enabled" } else { "disabled" });
-                update_tray(&engine, &app, &error);
+                update_tray(&engine, &app, &error, &search_error, &search_status);
+                Outcome::Continue
             }
-            Msg::Keymap => engine.keymap_changed(),
+            Msg::Keymap => {
+                engine.keymap_changed();
+                Outcome::Continue
+            }
+            Msg::SearchShown | Msg::SearchFocused | Msg::SearchHidden | Msg::SearchGone | Msg::SearchMode(_) | Msg::SearchTimeout(_) => {
+                let before = engine.profile_name().as_ptr();
+                let o = match msg {
+                    Msg::SearchShown => {
+                        engine.search_shown();
+                        Outcome::Continue
+                    }
+                    Msg::SearchFocused => engine.search_focused(out!()),
+                    Msg::SearchHidden => engine.search_hidden(out!()),
+                    Msg::SearchGone => engine.search_gone(out!()),
+                    Msg::SearchMode(m) => {
+                        engine.set_search_mode(m);
+                        Outcome::Continue
+                    }
+                    Msg::SearchTimeout(id) => engine.search_timeout(out!(), id),
+                    _ => unreachable!(),
+                };
+                if before != engine.profile_name().as_ptr() {
+                    update_tray(&engine, &app, &error, &search_error, &search_status);
+                }
+                o
+            }
+            Msg::SearchStatus(s) => {
+                search_status = s;
+                update_tray(&engine, &app, &error, &search_error, &search_status);
+                Outcome::Continue
+            }
+            Msg::SearchToggle => {
+                search.send(mmk_common::proto::Msg::new("toggle"));
+                Outcome::Continue
+            }
             Msg::Quit => break,
+        };
+        if let Some(u) = ui.as_mut()
+            && let Err(e) = u.flush()
+        {
+            eprintln!("mmk: write to virtual keyboard: {e}");
+        }
+        match outcome {
+            Outcome::Exit => {
+                eprintln!("mmk: panic chord pressed, exiting");
+                break;
+            }
+            Outcome::Toggled(on) => {
+                eprintln!("mmk: remapping {}", if on { "enabled" } else { "disabled" });
+                update_tray(&engine, &app, &error, &search_error, &search_status);
+            }
+            Outcome::Continue => {}
         }
     }
 
-    engine.release_all(&mut ui);
-    let _ = ui.flush();
-    drop(ui);
+    engine.release_all(out!());
+    if let Some(mut u) = ui {
+        let _ = u.flush();
+    }
+    let _ = std::fs::remove_file(search::socket_path());
     eprintln!("mmk: stopped");
     0
 }
@@ -401,6 +562,10 @@ fn check(path: &Path) -> i32 {
         Ok((c, from_file)) => {
             let src = if from_file { path.display().to_string() } else { "built-in default".into() };
             let rules: usize = c.base.rules.len();
+            if let Some(e) = &c.search_error {
+                eprintln!("mmk: {src}: {e}");
+                return 1;
+            }
             println!("ok: {src}: {rules} global rules, {} app profiles", c.apps.len());
             0
         }

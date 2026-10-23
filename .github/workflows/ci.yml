@@ -10,7 +10,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
@@ -21,5 +21,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
-      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: GTK4 and VTE headers (search window)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-4-dev libvte-2.91-gtk4-dev
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p mmk
+      - run: cargo build --locked --release -p mmk-search-ui

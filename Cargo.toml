@@ -1,16 +1,22 @@
 [package]
 name = "mmk"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2024"
 description = "Mac-style keyboard remapper for Apple keyboards on Linux"
 
 [dependencies]
+mmk-common = { path = "crates/common" }
 libc = "0.2"
 x11rb = "0.14"
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 lexopt = "0.3"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[workspace]
+members = [".", "crates/common", "crates/search-ui"]
+# `cargo build` / `cargo test` stay musl-friendly: the GTK binary is built with `-p mmk-search-ui`.
+default-members = [".", "crates/common"]
 
 [profile.release]
 opt-level = 3

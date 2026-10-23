@@ -4,11 +4,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::{self, home};
-use crate::{devices, focus, sys};
+use crate::{devices, focus, search, sys};
 
 const UDEV_RULE: &str = "/etc/udev/rules.d/70-mmk.rules";
 const MODULES_LOAD: &str = "/etc/modules-load.d/mmk.conf";
@@ -18,7 +18,7 @@ KERNEL==\"uinput\", SUBSYSTEM==\"misc\", TAG+=\"uaccess\", OPTIONS+=\"static_nod
 SUBSYSTEM==\"input\", KERNEL==\"event*\", ATTRS{id/vendor}==\"05ac\", TAG+=\"uaccess\"
 SUBSYSTEM==\"input\", KERNEL==\"event*\", ATTRS{id/vendor}==\"004c\", TAG+=\"uaccess\"
 ";
-fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/mmk-{}", unsafe { libc::getuid() })))
@@ -28,16 +28,25 @@ fn lock_path() -> PathBuf {
     runtime_dir().join("mmk.lock")
 }
 
-fn bin_path() -> PathBuf {
+pub fn bin_path() -> PathBuf {
     home().join(".local/bin/mmk")
 }
 
-fn log_path() -> PathBuf {
+pub fn log_path() -> PathBuf {
     home().join(".local/state/mmk/mmk.log")
 }
 
 fn state_dir() -> PathBuf {
     home().join(".local/state/mmk")
+}
+
+/// Files the search UI writes (§16.11, §16.7.2, §16.6.6).
+fn search_data() -> [PathBuf; 3] {
+    [
+        home().join(".cache/mmk/files.idx"),
+        state_dir().join("search-history.tsv"),
+        state_dir().join("codes.tsv"),
+    ]
 }
 
 fn autostart_path() -> PathBuf {
@@ -60,7 +69,7 @@ pub fn lock_instance() -> Result<File, String> {
 }
 
 /// Pid of the running mmk, if any.
-fn running_pid() -> Option<i32> {
+pub fn running_pid() -> Option<i32> {
     let mut f = File::open(lock_path()).ok()?;
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
@@ -203,6 +212,37 @@ pub fn install(yes: bool) -> i32 {
         }
         _ => println!("[binary] {} (already in place)", bin.display()),
     }
+    // The search window, shipped next to mmk; optional (remapping works without it).
+    let ui_dst = bin.with_file_name(search::UI_BIN);
+    match std::env::current_exe().map(|e| e.with_file_name(search::UI_BIN)) {
+        Ok(src) if src.is_file() && fs::canonicalize(&src).ok() != fs::canonicalize(&ui_dst).ok() => {
+            let tmp = ui_dst.with_extension("new");
+            match fs::copy(&src, &tmp).and_then(|_| fs::rename(&tmp, &ui_dst)) {
+                Ok(()) => println!("[binary] installed {}", ui_dst.display()),
+                Err(e) => println!("[binary] {}: {e} (search will be unavailable)", ui_dst.display()),
+            }
+        }
+        Ok(src) if src.is_file() => println!("[binary] {} (already in place)", ui_dst.display()),
+        _ if ui_dst.is_file() => println!("[binary] {} (kept; none next to this mmk)", ui_dst.display()),
+        _ => println!("[binary] {} not found next to this mmk: search will be unavailable", search::UI_BIN),
+    }
+    // The search window links the system's GTK4 and VTE (GTK4 build): if they are missing it
+    // can't start, and says why on stderr.
+    if ui_dst.is_file() {
+        match Command::new(&ui_dst).arg("--version").stdout(Stdio::null()).stderr(Stdio::piped()).output() {
+            Ok(o) if o.status.success() => println!("[search] ok"),
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr);
+                println!("[search] the search window can't start: {}", why.lines().next().unwrap_or("").trim());
+                println!("         it needs GTK4 and VTE for GTK4, e.g.:");
+                println!("           Debian/Ubuntu/Mint: sudo apt install libgtk-4-1 libvte-2.91-gtk4-0");
+                println!("           Fedora:             sudo dnf install gtk4 vte291-gtk4");
+                println!("           Arch:               sudo pacman -S gtk4 vte4");
+                println!("         Remapping works without it.");
+            }
+            Err(e) => println!("[search] {}: {e}", ui_dst.display()),
+        }
+    }
 
     // 3. Config.
     let cfg = config::default_path();
@@ -267,11 +307,13 @@ pub fn uninstall(purge: bool) -> i32 {
     if stop_running() {
         println!("[stop] stopped mmk");
     }
-    for p in [autostart_path(), bin_path()] {
+    let ui = bin_path().with_file_name(search::UI_BIN);
+    for p in [autostart_path(), bin_path(), ui].into_iter().chain(search_data()) {
         if fs::remove_file(&p).is_ok() {
             println!("[remove] {}", p.display());
         }
     }
+    let _ = fs::remove_dir(home().join(".cache/mmk")); // only if empty
     crate::tray::remove_icons();
     if Path::new(UDEV_RULE).exists() || Path::new(MODULES_LOAD).exists() {
         println!("[permissions] removing {UDEV_RULE} and {MODULES_LOAD} (needs root)");
@@ -307,10 +349,40 @@ pub fn doctor(cfg_path: &Path) -> i32 {
     for p in unreadable_apple_nodes() {
         check(false, format!("no access to {} (run `mmk install`)", p.display()));
     }
-    match config::load(cfg_path) {
+    let cfg = config::load(cfg_path);
+    match &cfg {
         Ok((_, true)) => check(true, format!("config {}", cfg_path.display())),
         Ok((_, false)) => check(true, "config: built-in default (no file)".into()),
         Err(e) => check(false, format!("config: {e}")),
+    }
+    if let Ok((c, _)) = &cfg {
+        if let Some(e) = &c.search_error {
+            check(false, format!("config [search]: {e}"));
+        }
+        if !c.remapping {
+            println!("     remapping = false: search only");
+        }
+        if !c.search.enabled {
+            println!("     search: disabled ([search] enabled = false)");
+        } else {
+            match search::ui_binary() {
+                None => check(false, format!("search: {} not found next to mmk or on $PATH", search::UI_BIN)),
+                Some(bin) => {
+                    let v = Command::new(&bin).arg("--version").output();
+                    match v {
+                        Ok(o) if o.status.success() => {
+                            let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            check(true, format!("search: {} ({ver})", bin.display()));
+                        }
+                        Ok(o) => check(false, format!("search: {} does not run: {}", bin.display(), String::from_utf8_lossy(&o.stderr).trim())),
+                        Err(e) => check(false, format!("search: {}: {e}", bin.display())),
+                    }
+                }
+            }
+            let sock = search::socket_path();
+            let up = std::os::unix::net::UnixStream::connect(&sock).is_ok();
+            println!("     search socket: {} ({})", sock.display(), if up { "answering" } else { "not answering" });
+        }
     }
     match focus::current_x11() {
         Some(f) => check(true, format!("focus (x11): {:?} / {:?}", f.app_id, f.instance)),

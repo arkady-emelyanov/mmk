@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::{Action, Config, Profile};
+use crate::config::{Action, Config, Profile, SearchReq};
 use crate::keys::*;
 
 /// Where emitted key events go (the uinput device, or a recorder in tests).
@@ -32,6 +32,35 @@ pub enum Outcome {
     Toggled(bool),
 }
 
+/// Capacity of the hold buffer (§16.14); a full buffer ends the hold.
+pub const HOLD_CAP: usize = 64;
+
+/// A search request for the supervisor. `hold`: the engine is holding keys until it gets
+/// `search_focused`, `search_hidden` or `search_timeout(hold)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchCall {
+    pub req: SearchReq,
+    pub hold: Option<u32>,
+}
+
+/// The search window's state as last reported by the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    #[default]
+    Search,
+    Terminal,
+}
+
+/// Physical key events typed while the search window is being shown.
+struct Hold {
+    active: bool,
+    id: u32,
+    buf: [(u16, i32); HOLD_CAP],
+    len: usize,
+    /// Physical key state as of the last buffered event (for the panic chord).
+    down: Vec<bool>,
+}
+
 /// What a held physical key is currently producing.
 #[derive(Clone)]
 enum Active {
@@ -41,7 +70,14 @@ enum Active {
 
 pub struct Engine {
     cfg: Arc<Config>,
+    /// The profile in effect: the tracked one, or the search override.
     profile: Arc<Profile>,
+    /// The profile of the focused app, as the focus tracker reports it.
+    tracked: Arc<Profile>,
+    /// The search window is shown: the profile follows `search_mode`, not the focus tracker.
+    search_shown: bool,
+    search_mode: SearchMode,
+    hold: Hold,
     focus: (String, String),
     cache: HashMap<(String, String), Arc<Profile>>,
     enabled: bool,
@@ -54,6 +90,8 @@ pub struct Engine {
     cmd_down_at: Option<Instant>,
     cmd_alone: bool,
     pub exec: Box<dyn FnMut(&str) + Send>,
+    /// Search requests go here (to the supervisor); never blocks.
+    pub search: Box<dyn FnMut(SearchCall) + Send>,
     typist: Option<Box<dyn Typist>>,
     pub verbose: bool,
 }
@@ -62,6 +100,10 @@ impl Engine {
     pub fn new(cfg: Arc<Config>) -> Self {
         Engine {
             profile: cfg.base.clone(),
+            tracked: cfg.base.clone(),
+            search_shown: false,
+            search_mode: SearchMode::Search,
+            hold: Hold { active: false, id: 0, buf: [(0, 0); HOLD_CAP], len: 0, down: vec![false; KEY_MAX] },
             cfg,
             focus: Default::default(),
             cache: HashMap::new(),
@@ -74,9 +116,14 @@ impl Engine {
             cmd_down_at: None,
             cmd_alone: false,
             exec: Box::new(|_| {}),
+            search: Box::new(|_| {}),
             typist: None,
             verbose: false,
         }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     pub fn profile_name(&self) -> &str {
@@ -92,11 +139,143 @@ impl Engine {
         let key = (app_id.to_string(), instance.to_string());
         let cfg = &self.cfg;
         let p = self.cache.entry(key.clone()).or_insert_with(|| cfg.match_app(app_id, instance)).clone();
-        if self.verbose && p.name != self.profile.name {
+        if self.verbose && p.name != self.tracked.name {
             eprintln!("focus: {app_id:?} ({instance:?}) -> profile {}", p.name);
         }
-        self.profile = p;
+        self.tracked = p;
         self.focus = key;
+        self.apply_profile();
+    }
+
+    /// The tracked profile, unless the search window overrides it (§16.14).
+    fn apply_profile(&mut self) {
+        self.profile = if !self.search_shown {
+            self.tracked.clone()
+        } else if self.search_mode == SearchMode::Terminal {
+            self.cfg.profile_named(&self.cfg.search.terminal_profile).unwrap_or(&self.cfg.base).clone()
+        } else {
+            self.cfg.base.clone()
+        };
+    }
+
+    /// Whether keys are being held for the search window.
+    #[cfg(test)]
+    pub fn holding(&self) -> bool {
+        self.hold.active
+    }
+
+    /// The UI showed its window.
+    pub fn search_shown(&mut self) {
+        self.search_shown = true;
+        self.apply_profile();
+    }
+
+    /// The window has keyboard focus: replay held keys into it.
+    pub fn search_focused(&mut self, out: &mut dyn Sink) -> Outcome {
+        self.search_shown();
+        self.end_hold(out)
+    }
+
+    /// The window was hidden (or its process died): back to the tracked profile.
+    pub fn search_hidden(&mut self, out: &mut dyn Sink) -> Outcome {
+        self.search_shown = false;
+        self.apply_profile();
+        self.end_hold(out)
+    }
+
+    /// The UI process is gone: drop the override and its mode.
+    pub fn search_gone(&mut self, out: &mut dyn Sink) -> Outcome {
+        self.search_mode = SearchMode::Search;
+        self.search_hidden(out)
+    }
+
+    /// The UI switched between search and the inline terminal.
+    pub fn set_search_mode(&mut self, mode: SearchMode) {
+        self.search_mode = mode;
+        self.apply_profile();
+    }
+
+    /// `hold_ms` passed since the request that started hold `id`.
+    pub fn search_timeout(&mut self, out: &mut dyn Sink, id: u32) -> Outcome {
+        if self.hold.active && self.hold.id == id { self.end_hold(out) } else { Outcome::Continue }
+    }
+
+    fn request_search(&mut self, req: SearchReq) {
+        // Opening the window: hold what is typed next until it has focus. Keys already
+        // down are not held (their releases pass, see `hold_event`).
+        let hold = if req != SearchReq::Hide && !self.search_shown && !self.hold.active {
+            self.hold.id = self.hold.id.wrapping_add(1);
+            self.hold.active = true;
+            self.hold.len = 0;
+            self.hold.down.copy_from_slice(&self.held);
+            Some(self.hold.id)
+        } else {
+            None
+        };
+        if req == SearchReq::Terminal {
+            // The UI reports `mode terminal` after `focused`; the replay must already use it.
+            self.search_mode = SearchMode::Terminal;
+        }
+        if self.verbose {
+            eprintln!("search: {} (hold {hold:?})", req.verb());
+        }
+        (self.search)(SearchCall { req, hold });
+    }
+
+    /// Stop holding and replay the held events through the normal pipeline.
+    fn end_hold(&mut self, out: &mut dyn Sink) -> Outcome {
+        if !self.hold.active {
+            return Outcome::Continue;
+        }
+        self.hold.active = false;
+        let (buf, len) = (self.hold.buf, self.hold.len);
+        self.hold.len = 0;
+        let mut result = Outcome::Continue;
+        for &(code, value) in &buf[..len] {
+            // A replayed search action may start a new hold: the rest goes into it.
+            match self.handle(out, code, value) {
+                Outcome::Exit => return Outcome::Exit,
+                Outcome::Continue => {}
+                o => result = o,
+            }
+        }
+        result
+    }
+
+    /// Buffer a physical event during a hold. `None`: handle it live instead.
+    fn hold_event(&mut self, out: &mut dyn Sink, code: u16, value: i32) -> Option<Outcome> {
+        let c = self.cfg.remap[code as usize] as usize;
+        if value == 2 {
+            return Some(Outcome::Continue); // repeats: dropped, the replayed press stands for them
+        }
+        if value == 0 && self.hold.len == 0 {
+            // Down since before the trigger: release it now. After a buffered event it has
+            // to wait its turn, or the replay would see the modifiers change under it.
+            self.hold.down[c] = false;
+            return None;
+        }
+        if self.hold.len == HOLD_CAP {
+            // Full: replay what we have, then this event (a replayed search action may have
+            // started a new hold that takes it).
+            return Some(match self.end_hold(out) {
+                Outcome::Exit => Outcome::Exit,
+                o => match self.handle(out, code, value) {
+                    Outcome::Continue => o,
+                    o2 => o2,
+                },
+            });
+        }
+        self.hold.down[c] = value == 1;
+        if value == 1 && !self.cfg.panic.is_empty() && self.cfg.panic.iter().all(|k| self.hold.down[*k as usize]) {
+            // Never held back: the panic chord exits at once.
+            self.hold.active = false;
+            self.hold.len = 0;
+            self.release_all(out);
+            return Some(Outcome::Exit);
+        }
+        self.hold.buf[self.hold.len] = (code, value);
+        self.hold.len += 1;
+        Some(Outcome::Continue)
     }
 
     pub fn set_typist(&mut self, mut t: Box<dyn Typist>) {
@@ -145,6 +324,11 @@ impl Engine {
     pub fn handle(&mut self, out: &mut dyn Sink, code: u16, value: i32) -> Outcome {
         if code as usize >= KEY_MAX || !(0..=2).contains(&value) {
             return Outcome::Continue;
+        }
+        if self.hold.active
+            && let Some(o) = self.hold_event(out, code, value)
+        {
+            return o;
         }
         let code = self.cfg.remap[code as usize];
         let c = code as usize;
@@ -323,7 +507,7 @@ impl Engine {
                         self.run(out, &action);
                         self.active[c] = Some(Active::Seq(action));
                     }
-                    Action::Exec(_) => self.run(out, &action),
+                    Action::Exec(_) | Action::Search(_) => self.run(out, &action),
                     Action::None => {}
                 }
             }
@@ -409,6 +593,7 @@ impl Engine {
                 self.sync(out, &[], false);
             }
             Action::Exec(cmd) => (self.exec)(cmd),
+            Action::Search(req) => self.request_search(*req),
             Action::None => {}
         }
     }
@@ -867,6 +1052,129 @@ mod tests {
     fn remap_applies_first() {
         let mut t = T::with("[remap]\ncapslock = \"esc\"\n", "");
         assert_eq!(t.feed("+capslock -capslock"), "+esc -esc");
+    }
+
+    const SEARCH_CFG: &str = "[keys]\n\"cmd-shift-space\" = \"search\"\n\"cmd-shift-enter\" = \"search:terminal\"\n\"cmd-left\" = \"home\"\n[[app]]\nname = \"terminal\"\nclass = [\"kitty\"]\ncmd = \"ctrl-shift\"\n";
+
+    /// An engine whose search requests are recorded.
+    fn search_engine(app: &str) -> (T, Arc<std::sync::Mutex<Vec<SearchCall>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut t = T::with(SEARCH_CFG, app);
+        let c = calls.clone();
+        t.e.search = Box::new(move |call| c.lock().unwrap().push(call));
+        (t, calls)
+    }
+
+    #[test]
+    fn search_holds_keys_until_focused_with_override() {
+        let (mut t, calls) = search_engine("kitty");
+        assert_eq!(t.feed("+leftmeta +leftshift +space"), "+leftshift");
+        assert_eq!(*calls.lock().unwrap(), vec![SearchCall { req: SearchReq::Toggle, hold: Some(1) }]);
+        assert!(t.e.holding());
+        // Keys down since before the trigger are released live while nothing is buffered.
+        assert_eq!(t.feed("-space -leftshift"), "-leftshift");
+        assert_eq!(t.feed("+c -c -leftmeta +a =a"), "");
+        t.e.search_shown();
+        assert_eq!(t.feed("+b"), "", "still holding until focused");
+        t.e.search_focused(&mut t.out);
+        // Replayed with the global profile (Cmd+C is Ctrl+C, not the terminal's Ctrl+Shift+C).
+        assert_eq!(t.out.take(), "+leftctrl +c -c -leftctrl +a +b");
+        assert!(!t.e.holding());
+        assert_eq!(t.feed("-a -b"), "-a -b");
+        t.assert_clean();
+        // Focus tracking is ignored while shown, applies again once hidden.
+        t.e.set_focus("kitty", "kitty");
+        assert_eq!(t.e.profile_name(), "global");
+        t.e.search_hidden(&mut t.out);
+        assert_eq!(t.e.profile_name(), "terminal");
+    }
+
+    #[test]
+    fn search_toggle_while_shown_does_not_hold() {
+        let (mut t, calls) = search_engine("");
+        t.e.search_shown();
+        assert_eq!(t.feed("+leftmeta +leftshift +space -space -leftshift -leftmeta +x -x"), "+leftshift -leftshift +x -x");
+        assert_eq!(calls.lock().unwrap()[0].hold, None);
+    }
+
+    #[test]
+    fn search_terminal_mode_uses_terminal_profile() {
+        let (mut t, _) = search_engine("firefox");
+        t.feed("+leftmeta +leftshift +enter -enter -leftshift");
+        assert_eq!(t.feed("+c -c"), "");
+        t.e.search_focused(&mut t.out);
+        assert_eq!(t.out.take(), "+leftctrl +leftshift +c -c");
+        assert_eq!(t.e.profile_name(), "terminal");
+        assert_eq!(t.feed("-leftmeta"), "-leftctrl -leftshift");
+        t.e.set_search_mode(SearchMode::Search);
+        assert_eq!(t.e.profile_name(), "global");
+        t.e.set_search_mode(SearchMode::Terminal);
+        t.e.search_gone(&mut t.out);
+        assert_eq!(t.e.profile_name(), "global", "firefox: tracked profile");
+        t.e.search_shown();
+        assert_eq!(t.feed("+leftmeta +c -c -leftmeta"), "+leftctrl +c -c -leftctrl", "gone resets the mode");
+        t.assert_clean();
+    }
+
+    #[test]
+    fn search_hold_ends_on_timeout_or_hidden() {
+        let (mut t, _) = search_engine("kitty");
+        t.feed("+leftmeta +leftshift +space -space -leftshift -leftmeta");
+        assert_eq!(t.feed("+x"), "");
+        t.e.search_timeout(&mut t.out, 7); // a stale timer
+        assert!(t.e.holding());
+        t.e.search_timeout(&mut t.out, 1);
+        assert_eq!(t.out.take(), "+x");
+        assert_eq!(t.feed("-x"), "-x");
+        // Second hold: the UI answers `hidden` (e.g. it could not show).
+        t.feed("+leftmeta +leftshift +space -space -leftshift -leftmeta");
+        assert_eq!(t.feed("+leftmeta +c -c -leftmeta"), "");
+        t.e.search_hidden(&mut t.out);
+        assert_eq!(t.out.take(), "+leftctrl +leftshift +c -c -leftctrl -leftshift", "no override: kitty");
+        t.e.search_timeout(&mut t.out, 2); // late timer: nothing to do
+        t.assert_clean();
+    }
+
+    #[test]
+    fn search_panic_chord_never_held() {
+        let (mut t, _) = search_engine("");
+        t.feed("+leftmeta +leftshift +space -space -leftshift -leftmeta");
+        t.feed("+leftctrl +esc +backspace");
+        let enter = lookup_key("enter").unwrap();
+        assert_eq!(t.e.handle(&mut t.out, enter, 1), Outcome::Exit);
+        assert!(!t.e.holding());
+        t.out.take();
+        t.assert_clean();
+        // Also with part of the chord held since before the trigger.
+        let (mut t, _) = search_engine("");
+        t.feed("+leftctrl +leftmeta +leftshift +space -space");
+        t.feed("+esc +backspace");
+        assert_eq!(t.e.handle(&mut t.out, enter, 1), Outcome::Exit);
+    }
+
+    #[test]
+    fn search_hold_overflow_replays() {
+        let (mut t, _) = search_engine("");
+        t.feed("+leftmeta +leftshift +space -space -leftshift -leftmeta");
+        let n = HOLD_CAP / 2;
+        assert_eq!(t.feed(&"+a -a ".repeat(n)), "");
+        assert!(t.e.holding());
+        // One more: the buffer is full, everything comes out in order, then the new key.
+        assert_eq!(t.feed("+b -b"), format!("{}+b -b", "+a -a ".repeat(n)));
+        assert!(!t.e.holding());
+        t.assert_clean();
+    }
+
+    #[test]
+    fn search_every_held_press_gets_its_release() {
+        let (mut t, _) = search_engine("");
+        t.feed("+leftmeta +leftshift +space -space -leftshift -leftmeta");
+        t.feed("+leftmeta +left +q -q");
+        t.e.search_focused(&mut t.out);
+        assert_eq!(t.out.take(), "+home +leftctrl +q -q");
+        assert_eq!(t.feed("-left -leftmeta"), "-home -leftctrl");
+        t.assert_clean();
+        t.assert_no_lone_alt();
     }
 
     /// Every default rule, in every profile: no lone Alt, nothing left held.

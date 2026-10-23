@@ -1,0 +1,28 @@
+[package]
+name = "mmk-search-ui"
+version = "1.4.0"
+edition = "2024"
+description = "mmk's Spotlight-style search window (GTK4), run and supervised by mmk"
+
+[dependencies]
+mmk-common = { path = "../common" }
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+lexopt = "0.3"
+gio = "0.22"
+gio-unix = "0.22"
+glib = "0.22"
+glib-unix = "0.22"
+nucleo = "0.5"
+fend-core = "1"
+ignore = "0.4"
+gtk4 = { version = "0.11", features = ["v4_12"], optional = true }
+vte4 = { version = "0.10", optional = true }
+gdk4-x11 = { version = "0.11", optional = true }
+x11rb = { version = "0.14", optional = true }
+
+[features]
+# The window. Without it the binary still answers `--query` (tests, CI without GTK).
+default = ["gui"]
+gui = ["dep:gtk4", "dep:vte4", "dep:gdk4-x11", "dep:x11rb"]

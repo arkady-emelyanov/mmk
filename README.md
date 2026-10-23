@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml/badge.svg)](https://github.com/arkady-emelyanov/mmk/actions/workflows/ci.yml)
 
-Make Linux feel like macOS on an Apple keyboard, so switching between the two is seamless: your Mac shortcuts just work, in every app.
+Make Linux feel like macOS on an Apple keyboard, so switching between the two is seamless: your Mac shortcuts just work, in every app. A Spotlight-style search window comes with it: apps, commands, files and a calculator in one box, which turns into a terminal when you run something (see [Search](#search)).
 
 ## Supported desktops
 
@@ -16,22 +16,25 @@ mmk reads the keyboard below the display server (evdev/uinput), so remapping doe
 
 ## Install
 
-Download the static binary for your machine from the [latest release](https://github.com/arkady-emelyanov/mmk/releases/latest) and run its installer:
+Download the archive for your machine from the [latest release](https://github.com/arkady-emelyanov/mmk/releases/latest) and run its installer:
 
 ```
-curl -Lo /tmp/mmk https://github.com/arkady-emelyanov/mmk/releases/latest/download/mmk-$(uname -m)-linux
-chmod +x /tmp/mmk
+curl -L https://github.com/arkady-emelyanov/mmk/releases/latest/download/mmk-$(uname -m)-linux.tar.gz | tar -xz -C /tmp
 /tmp/mmk install
 ```
 
-Builds are available for `x86_64` and `aarch64`; each has a `.sha256` file next to it. To build from source instead:
+The archive holds two programs: `mmk`, the remapper (a static binary that runs anywhere), and `mmk-search-ui`, the search window, which mmk starts and restarts on its own. The search window uses the system's GTK4 and VTE: install them if `mmk install` reports them missing (`sudo apt install libgtk-4-1 libvte-2.91-gtk4-0` on Debian, Ubuntu and Mint). The release builds need glibc 2.39 or newer (Linux Mint 22, Ubuntu 24.04, Debian 13); remapping works without the search window, and `mmk-<arch>-linux` alone is the remapper without search.
+
+Builds are available for `x86_64` and `aarch64`; each file has a `.sha256` next to it. To build from source instead (the search window needs `libgtk-4-dev` and `libvte-2.91-gtk4-dev`):
 
 ```
-cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl -p mmk
+cargo build --release -p mmk-search-ui
+cp target/release/mmk-search-ui target/x86_64-unknown-linux-musl/release/
 target/x86_64-unknown-linux-musl/release/mmk install
 ```
 
-`mmk install` sets up permissions (one `pkexec` step, only if needed), copies the binary to `~/.local/bin`, writes `~/.config/mmk/config.toml`, adds an autostart entry, warns about other running key remappers, and starts mmk. `mmk uninstall` reverses all of it.
+`mmk install` sets up permissions (one `pkexec` step, only if needed), copies both programs to `~/.local/bin`, checks that the search window can start, writes `~/.config/mmk/config.toml`, adds an autostart entry, warns about other running key remappers, and starts mmk. `mmk uninstall` reverses all of it, including the search index and history.
 
 ### Why the installer may ask for your password
 
@@ -60,6 +63,55 @@ The step is skipped if you already have access. That happens, for example, when 
 - Tray icon: enable/disable, current profile, reload, open config, quit.
 - Emergency exit: hold `Esc+Backspace+Enter`.
 - Log: `~/.local/state/mmk/mmk.log`.
+
+## Search
+
+Press the hotkey and a search box appears centered on the screen; type, and results appear below it: apps (including executables and AppImages in `~/Apps` and `~/Applications`), commands on your `$PATH`, files and folders in your home, and calculator answers (`2^10`, `5 km to mi`, `0xff to decimal`). What you pick often ranks higher next time.
+
+The hotkey is not bound by default. Add a rule for it, any trigger you like:
+
+```toml
+[keys]
+"cmd-shift-space" = "search"
+```
+
+Without an Apple keyboard, or to use a desktop shortcut instead, bind the command `mmk search` in your desktop's keyboard settings.
+
+| Key | Action |
+|---|---|
+| `Enter` | open the selected result; a command runs in the box's terminal |
+| `Cmd+Enter` | show the file (or the app's `.desktop` file) in the file manager |
+| `Shift+Enter` | run a command without a terminal |
+| `Cmd+C` | copy the result: path, answer, command line |
+| `Tab` | complete the entry to the selected result |
+| `↑` / `↓`, `Cmd+↑` / `Cmd+↓` | move the selection / jump between groups |
+| `Cmd+1` … `Cmd+9` | open the Nth result |
+| `Esc` | close |
+
+**Terminal in the box.** A query starting with `>` is a shell line (`> ls ~/Downloads | wc -l`), and `Enter` on a command runs it too: the box grows into a terminal running it. Inside it Cmd works as in other terminals (`Cmd+C` / `Cmd+V` copy and paste, `Cmd+=` / `Cmd+-` zoom), `Cmd+W` ends the session, and `Cmd+N` goes back to the search box while the session keeps running. When the program exits the window closes (`[search.terminal] on_exit = "search"` returns to the box instead).
+
+**Cheat codes.** Typing a code opens the terminal at once, with no `Enter`:
+
+- `@!` starts Claude Code. Its conversation is kept: the hotkey hides and shows the same session, and after it ends the next `@!` resumes that conversation (`claude --resume`). `Cmd+T` in it starts a fresh one.
+- `@#` opens a shell.
+
+Codes are config tables, so you can change these or add your own, with any program, folder and environment:
+
+```toml
+[search.codes.claude]
+cwd = "~/Projects"         # where Claude Code starts (default ~)
+
+[search.codes.top]
+code  = "@%"
+run   = "htop"
+shell = false              # run it directly: the session ends when it exits
+```
+
+Claude Code uses its own login. To give it a dedicated token instead, run `claude setup-token` and save the token to `~/.config/mmk/claude-token` (mode 0600): mmk passes it to Claude Code only, as `CLAUDE_CODE_OAUTH_TOKEN`.
+
+Everything else (size, theme, groups and their limits, which folders are indexed and which skipped, terminal font and size, keys) is under `[search]` in the config, with comments. The file index honors `.gitignore` files, so ignored files don't show up, and stays current as files change. Search never uses the network: only programs you start from it, like Claude Code, do.
+
+If the search window can't run (not installed, or GTK4 missing), mmk keeps remapping, the tray says why, and the hotkey shows a notification instead.
 
 ## Typography
 
@@ -143,12 +195,17 @@ A `class` glob matches either value. Without mmk you can run `xprop WM_CLASS` an
 - `Opt+letter` and `Opt+digit` shortcuts that type a character (see Typography) no longer reach apps as `Alt+letter`/`Alt+digit`, so menu accelerators on those keys don't work with `Opt`. Delete the rule from the config to get `Alt` back for a key.
 - `Cmd+click` is a plain click (Cmd is only translated together with a key); physical `Ctrl+click` works as usual.
 - Focus tracking (per-app profiles) works on X11. On Wayland sessions every app gets the global profile for now.
+- The search window is built and tested for X11. On Wayland it opens as a normal window, untested, and the compositor decides where.
 
 ## Develop
 
 ```
-cargo test                      # engine and config unit tests
-python3 tests/e2e.py            # end-to-end through a fake Apple keyboard (needs /dev/uinput access)
+cargo test                                  # remapper: engine and config unit tests
+cargo test -p mmk-search-ui                 # search: sources, ranking, index (needs the GTK4/VTE dev packages)
+cargo run -p mmk-search-ui -- --query fire  # ranked results without a window
+python3 tests/e2e.py                        # end-to-end through a fake Apple keyboard (needs /dev/uinput access)
 ```
+
+The workspace has three crates: `mmk` (the remapper, `src/`), `crates/common` (key names, the `[search]` config and the protocol between the two programs) and `crates/search-ui` (the window).
 
 The end-to-end test never touches the real keyboard or the desktop: it runs mmk against a fake uinput keyboard and grabs mmk's output device.

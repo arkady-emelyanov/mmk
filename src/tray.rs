@@ -14,6 +14,10 @@ pub struct Tray {
     pub app: String,
     pub keyboards: Vec<String>,
     pub error: Option<String>,
+    /// Search unavailable or failing.
+    pub search: Option<crate::search::Status>,
+    /// false: search only, no keyboards expected.
+    remapping: bool,
     pub config_path: PathBuf,
     /// Whether to offer the named symbolic icon (false: pixmap only, see `spawn`).
     named_icon: bool,
@@ -22,7 +26,7 @@ pub struct Tray {
 
 pub type Handle = ksni::blocking::Handle<Tray>;
 
-pub fn spawn(tx: Sender<Msg>, config_path: PathBuf) -> Option<Handle> {
+pub fn spawn(tx: Sender<Msg>, config_path: PathBuf, remapping: bool) -> Option<Handle> {
     let fresh = match install_icons() {
         Ok(changed) => changed,
         Err(e) => {
@@ -36,6 +40,8 @@ pub fn spawn(tx: Sender<Msg>, config_path: PathBuf) -> Option<Handle> {
         app: String::new(),
         keyboards: Vec::new(),
         error: None,
+        search: None,
+        remapping,
         config_path,
         // Panels notice new icon files only after their next periodic rescan; until then
         // show the pixmap, then switch to the named icon so the panel looks it up again.
@@ -69,7 +75,8 @@ enum State {
 
 impl Tray {
     fn state(&self) -> State {
-        if self.error.is_some() || self.keyboards.is_empty() {
+        let crashing = self.search.as_ref().is_some_and(|s| s.warn);
+        if self.error.is_some() || crashing || (self.remapping && self.keyboards.is_empty()) {
             State::Warning
         } else if self.enabled {
             State::Active
@@ -111,45 +118,68 @@ impl ksni::Tray for Tray {
         if let Some(e) = &self.error {
             d.push(e.clone());
         }
-        if self.keyboards.is_empty() {
-            d.push("No Apple keyboard found".into());
-        } else {
-            d.push(self.keyboards.join(", "));
+        if let Some(s) = &self.search {
+            d.push(s.text.clone());
         }
-        d.push(format!("Profile: {} ({})", self.profile, if self.app.is_empty() { "-" } else { &self.app }));
-        if !self.enabled {
-            d.push("Remapping disabled".into());
+        if !self.remapping {
+            d.push("Remapping off (search only)".into());
+        } else {
+            if self.keyboards.is_empty() {
+                d.push("No Apple keyboard found".into());
+            } else {
+                d.push(self.keyboards.join(", "));
+            }
+            d.push(format!("Profile: {} ({})", self.profile, if self.app.is_empty() { "-" } else { &self.app }));
+            if !self.enabled {
+                d.push("Remapping disabled".into());
+            }
         }
         ksni::ToolTip { title: "mmk".into(), description: d.join("\n"), ..Default::default() }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let kbds: Vec<MenuItem<Self>> = if self.keyboards.is_empty() {
-            vec![StandardItem { label: "none found".into(), enabled: false, ..Default::default() }.into()]
-        } else {
-            self.keyboards
-                .iter()
-                .map(|k| StandardItem { label: k.replace('_', "__"), enabled: false, ..Default::default() }.into())
-                .collect()
-        };
-        let mut items = vec![
-            CheckmarkItem {
-                label: "Enabled".into(),
-                checked: self.enabled,
+        let mut items: Vec<MenuItem<Self>> = Vec::new();
+        if self.remapping {
+            let kbds: Vec<MenuItem<Self>> = if self.keyboards.is_empty() {
+                vec![StandardItem { label: "none found".into(), enabled: false, ..Default::default() }.into()]
+            } else {
+                self.keyboards
+                    .iter()
+                    .map(|k| StandardItem { label: k.replace('_', "__"), enabled: false, ..Default::default() }.into())
+                    .collect()
+            };
+            items.extend([
+                CheckmarkItem {
+                    label: "Enabled".into(),
+                    checked: self.enabled,
+                    activate: Box::new(|t: &mut Self| {
+                        let _ = t.tx.send(Msg::SetEnabled(!t.enabled));
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: format!("Profile: {}", self.profile).replace('_', "__"),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+                SubMenu { label: "Keyboards".into(), submenu: kbds, ..Default::default() }.into(),
+            ]);
+        }
+        items.push(
+            StandardItem {
+                label: "Search".into(),
                 activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.send(Msg::SetEnabled(!t.enabled));
+                    let _ = t.tx.send(Msg::SearchToggle);
                 }),
                 ..Default::default()
             }
             .into(),
-            StandardItem {
-                label: format!("Profile: {}", self.profile).replace('_', "__"),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            SubMenu { label: "Keyboards".into(), submenu: kbds, ..Default::default() }.into(),
-        ];
+        );
+        if let Some(s) = &self.search {
+            items.push(StandardItem { label: s.text.replace('_', "__"), enabled: false, ..Default::default() }.into());
+        }
         if let Some(e) = &self.error {
             for line in e.lines() {
                 items.push(StandardItem { label: line.replace('_', "__"), enabled: false, ..Default::default() }.into());

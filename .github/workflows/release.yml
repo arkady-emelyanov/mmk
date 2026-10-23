@@ -1,6 +1,8 @@
 name: Release
 
-# Builds static binaries for a published GitHub release and attaches them to it.
+# Builds the binaries for a published GitHub release and attaches them to it:
+#   mmk-<arch>-linux         the remapper alone (static)
+#   mmk-<arch>-linux.tar.gz  the remapper and the search window (mmk-search-ui, needs GTK4)
 on:
   release:
     types: [published]
@@ -21,12 +23,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            asset: mmk-x86_64-linux
+            arch: x86_64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            asset: mmk-aarch64-linux
+            arch: aarch64
+    # Ubuntu 24.04: the search window then runs on glibc 2.39 / GTK 4.14 and newer
+    # (Linux Mint 22, Ubuntu 24.04, Debian 13).
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -35,16 +39,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo test --locked
-      - run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: Check the binary is static and reports the release version
+      - name: GTK4 and VTE headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-4-dev libvte-2.91-gtk4-dev
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p mmk
+      - run: cargo build --locked --release -p mmk-search-ui
+      - name: Check the binaries and package them
         run: |
-          bin=target/${{ matrix.target }}/release/mmk
-          file "$bin" | grep -q 'statically linked\|static-pie linked'
-          test "$("$bin" --version)" = "mmk ${TAG#v}"
-          cp "$bin" ${{ matrix.asset }}
-          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          mmk=target/${{ matrix.target }}/release/mmk
+          ui=target/release/mmk-search-ui
+          file "$mmk" | grep -q 'statically linked\|static-pie linked'
+          test "$("$mmk" --version)" = "mmk ${TAG#v}"
+          test "$("$ui" --version)" = "mmk-search-ui ${TAG#v}"
+          asset=mmk-${{ matrix.arch }}-linux
+          cp "$mmk" "$asset"
+          mkdir "$asset.d" && cp "$mmk" "$ui" "$asset.d/"
+          tar -C "$asset.d" -czf "$asset.tar.gz" mmk mmk-search-ui
+          sha256sum "$asset" > "$asset.sha256"
+          sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" ${{ matrix.asset }} ${{ matrix.asset }}.sha256 --clobber
+        run: |
+          a=mmk-${{ matrix.arch }}-linux
+          gh release upload "$TAG" "$a" "$a.sha256" "$a.tar.gz" "$a.tar.gz.sha256" --clobber

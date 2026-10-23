@@ -26,6 +26,29 @@ pub enum Action {
     Exec(String),
     /// Characters typed as text, e.g. an em dash.
     Text(String),
+    /// A request to the search window (`search`, `search:show`, ...).
+    Search(SearchReq),
+}
+
+/// What a `search*` action asks of the search window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReq {
+    Toggle,
+    Show,
+    Hide,
+    Terminal,
+}
+
+impl SearchReq {
+    /// The pipe verb (mmk_common::proto).
+    pub fn verb(self) -> &'static str {
+        match self {
+            SearchReq::Toggle => "toggle",
+            SearchReq::Show => "show",
+            SearchReq::Hide => "hide",
+            SearchReq::Terminal => "terminal",
+        }
+    }
 }
 
 pub fn parse_action(s: &str) -> Result<Action, String> {
@@ -42,6 +65,16 @@ pub fn parse_action(s: &str) -> Result<Action, String> {
     }
     if let Some(cmd) = s.strip_prefix("exec:") {
         return Ok(Action::Exec(cmd.trim().to_string()));
+    }
+    match s {
+        "search" => return Ok(Action::Search(SearchReq::Toggle)),
+        "search:show" => return Ok(Action::Search(SearchReq::Show)),
+        "search:hide" => return Ok(Action::Search(SearchReq::Hide)),
+        "search:terminal" => return Ok(Action::Search(SearchReq::Terminal)),
+        _ if s.starts_with("search:") => {
+            return Err(format!("{s:?}: unknown search action (search, search:show, search:hide, search:terminal)"));
+        }
+        _ => {}
     }
     let chords = s.split_whitespace().map(parse_chord).collect::<Result<Vec<_>, _>>()?;
     if chords.len() == 1 && chords[0].key != 0 {
@@ -72,6 +105,33 @@ pub struct Switcher {
     pub keys: HashSet<u16>,
 }
 
+/// What mmk itself needs of the `[search]` table; the rest is the UI's business.
+#[derive(Debug, Clone)]
+pub struct Search {
+    pub enabled: bool,
+    /// Max time typed-ahead keys are held after a `search` action.
+    pub hold_ms: u64,
+    /// App profile applied while the inline terminal is shown.
+    pub terminal_profile: String,
+    /// The effective `[search]` table as TOML text, forwarded to the UI (`config toml=`).
+    pub toml: String,
+}
+
+impl Search {
+    fn from_user(user: Option<toml::Value>) -> Result<Search, String> {
+        use mmk_common::search_config as sc;
+        let user = match user {
+            None => None,
+            Some(toml::Value::Table(t)) => Some(t),
+            Some(_) => return Err("search: expected a table ([search]); turn search off with `enabled = false` in it".into()),
+        };
+        let table = sc::effective_table(user);
+        let toml = toml::to_string(&table).map_err(|e| format!("[search] {e}"))?;
+        let c = sc::from_table(table)?;
+        Ok(Search { enabled: c.enabled, hold_ms: c.hold_ms, terminal_profile: c.terminal.profile, toml })
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub remap: Vec<u16>,
@@ -87,6 +147,12 @@ pub struct Config {
     pub switcher: Switcher,
     pub base: Arc<Profile>,
     pub apps: Vec<Arc<Profile>>,
+    /// false: never grab keyboards or create the virtual one; search, tray and reload only.
+    pub remapping: bool,
+    /// The default search settings when `search_error` is set (see `keep_search`).
+    pub search: Search,
+    /// A broken `[search]` table: reported, but never fails the config.
+    pub search_error: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -125,6 +191,10 @@ struct RawConfig {
     window_backend: Option<String>,
     grab_wait_ms: Option<u64>,
     open_retry_ms: Option<u64>,
+    remapping: Option<bool>,
+    /// Decoded and validated by mmk_common::search_config; kept loose here so a broken
+    /// `[search]` table never stops remapping.
+    search: Option<toml::Value>,
     switcher: Option<RawSwitcher>,
     #[serde(default)]
     remap: HashMap<String, String>,
@@ -178,6 +248,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
     let window_backend = user.window_backend.or(def.window_backend).expect("default: window_backend");
     let grab_wait_ms = user.grab_wait_ms.or(def.grab_wait_ms).expect("default: grab_wait_ms");
     let open_retry_ms = user.open_retry_ms.or(def.open_retry_ms).expect("default: open_retry_ms");
+    let remapping = user.remapping.or(def.remapping).expect("default: remapping");
     let sw_enter = us.enter.or(ds.enter).expect("default: switcher.enter");
     let sw_hold = us.hold.or(ds.hold).expect("default: switcher.hold");
     let sw_keys = us.keys.or(ds.keys).expect("default: switcher.keys");
@@ -247,6 +318,11 @@ pub fn parse(src: &str) -> Result<Config, String> {
         }));
     }
 
+    let (search, search_error) = match Search::from_user(user.search) {
+        Ok(s) => (s, None),
+        Err(e) => (Search::from_user(None).expect("default [search] must be valid"), Some(e)),
+    };
+
     Ok(Config {
         remap,
         alt_guard,
@@ -261,6 +337,9 @@ pub fn parse(src: &str) -> Result<Config, String> {
         switcher,
         base,
         apps,
+        remapping,
+        search,
+        search_error,
     })
 }
 
@@ -287,6 +366,18 @@ fn parse_mods(s: &str) -> Result<Vec<u16>, String> {
 }
 
 impl Config {
+    /// With a broken `[search]` table, carry over the search settings in effect before.
+    pub fn keep_search(&mut self, previous: &Config) {
+        if self.search_error.is_some() {
+            self.search = previous.search.clone();
+        }
+    }
+
+    /// The app profile named `name`, if any.
+    pub fn profile_named(&self, name: &str) -> Option<&Arc<Profile>> {
+        self.apps.iter().find(|p| p.name == name)
+    }
+
     /// Every character a `text:` action can type, for preparing the keymap.
     pub fn text_chars(&self) -> Vec<char> {
         let mut set = std::collections::BTreeSet::new();
@@ -393,6 +484,33 @@ mod tests {
         assert_eq!(c.match_app("orca", "orca").name, "orca");
         assert_eq!(c.match_app("FreeCAD", "freecad").name, "global");
         assert_eq!(c.match_app("", "").name, "global");
+    }
+
+    #[test]
+    fn search_settings() {
+        let c = parse(DEFAULT_CONFIG).unwrap();
+        assert!(c.remapping && c.search.enabled && c.search_error.is_none());
+        assert_eq!((c.search.hold_ms, c.search.terminal_profile.as_str()), (300, "terminal"));
+        let t: toml::Table = c.search.toml.parse().unwrap();
+        assert_eq!(t["width"].as_integer(), Some(720));
+        let c = parse("remapping = false\n[search]\nhold_ms = 50\n[search.terminal]\nprofile = \"kitty\"\n").unwrap();
+        assert!(!c.remapping);
+        assert_eq!((c.search.hold_ms, c.search.terminal_profile.as_str()), (50, "kitty"));
+        assert!(matches!(parse_action("search:terminal").unwrap(), Action::Search(SearchReq::Terminal)));
+        assert!(parse_action("search:bogus").is_err());
+    }
+
+    #[test]
+    fn broken_search_keeps_the_rest() {
+        let prev = parse("[search]\nhold_ms = 77\n").unwrap();
+        for src in ["[search]\ntheme = \"pink\"\n", "search = 1\n", "[search]\nbogus = 1\n"] {
+            let mut c = parse(&format!("cmd_tap_ms = 9\n{src}")).unwrap();
+            assert_eq!(c.cmd_tap_ms, 9);
+            assert!(c.search_error.is_some(), "{src}");
+            assert_eq!(c.search.hold_ms, 300, "default until carried over");
+            c.keep_search(&prev);
+            assert_eq!(c.search.hold_ms, 77);
+        }
     }
 
     #[test]

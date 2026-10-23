@@ -1,0 +1,9 @@
+[package]
+name = "mmk-common"
+version = "1.4.0"
+edition = "2024"
+description = "Shared by mmk and mmk-search-ui: key names and chords, the [search] config, the pipe protocol"
+
+[dependencies]
+toml = "1"
+serde = { version = "1", features = ["derive"] }

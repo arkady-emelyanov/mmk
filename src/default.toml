@@ -26,6 +26,7 @@ tray           = true                    # show the tray icon
 window_backend = "auto"                  # auto | x11 | none
 grab_wait_ms   = 3000                    # max wait for all keys up before grabbing a keyboard
 open_retry_ms  = 1000                    # how long to retry opening a hotplugged keyboard
+remapping      = true                    # false: never grab keyboards, run search only (no Apple keyboard)
 
 # Cmd+Tab: while Cmd stays held, `keys` are sent with `hold` held; releasing Cmd releases it.
 [switcher]
@@ -64,6 +65,8 @@ keys  = ["tab", "grave", "left", "right", "up", "down", "esc", "enter"]
 "cmd-delete"       = "shift-end delete"
 # system
 "cmd-space"        = "super-space"       # keyboard layout switch
+# "cmd-shift-space" = "search"           # opt-in: Spotlight-style search window; unbound by default
+# "cmd-shift-enter" = "search:terminal"  # opt-in: straight into the search window's terminal
 "cmd-q"            = "alt-f4"
 "cmd-ctrl-q"       = "screenlock"
 "cmd-ctrl-f"       = "alt-f10"           # toggle maximize
@@ -111,6 +114,104 @@ keys  = ["tab", "grave", "left", "right", "up", "down", "esc", "enter"]
 "opt-b"                = "text:∫"
 "opt-z"                = "text:Ω"
 "opt-m"                = "text:µ"
+
+# --- search: Spotlight-style window (mmk-search-ui), opened by a "search" rule or `mmk search` ---
+[search]
+enabled           = true                 # run the search window process (mmk-search-ui)
+width             = 720
+max_rows          = 9
+font_scale        = 1.6                  # entry font size, relative to the desktop font
+theme             = "auto"               # auto | light | dark
+accent            = "auto"               # auto (desktop accent) or a CSS color
+restore_query     = true                 # reopening shows the previous query, selected
+empty             = "nothing"            # empty query shows: nothing | recent
+close_on_focus_loss = true
+display           = "auto"               # auto | x11 | layer-shell | fallback
+external_terminal = "auto"               # terminal for commands.enter = "external": auto or a command
+hold_ms           = 300                  # max time keys typed before the window has focus are held
+
+[search.keys]
+open       = ["enter"]
+reveal     = ["ctrl-enter"]
+alt        = ["shift-enter"]
+copy       = ["ctrl-c"]
+complete   = ["tab", "right"]            # `right` only with the caret at the end of the entry
+close      = ["esc"]
+next       = ["down", "ctrl-n"]
+prev       = ["up", "ctrl-p"]
+next_group = ["pagedown", "ctrl-down", "ctrl-end"]
+prev_group = ["pageup", "ctrl-up", "ctrl-home"]
+
+[search.apps]
+dirs = ["~/Applications", "~/Apps"]      # executables and AppImages in these folders are apps too
+
+[search.groups]
+order          = ["apps", "commands", "files"]
+apps.limit     = 4
+commands.limit = 3
+files.limit    = 6
+
+[search.ranking]
+half_life_days = 14.0
+history_max    = 5000
+weights        = { apps = 1.0, commands = 0.6, files = 0.8 }
+
+[search.commands]
+enabled = true
+enter   = "inline"                       # inline (terminal in the window) | external | detached
+alt     = "detached"
+
+[search.terminal]
+enabled       = true
+prefix        = ">"                      # a query starting with this is a raw shell line
+profile       = "terminal"               # mmk profile applied while the terminal is shown
+width         = 720                      # same as the search box: the box only grows down
+height        = 560
+radius        = 12
+animation_ms  = 220                      # 0 = instant
+cwd           = "~"
+font          = "auto"                   # auto = desktop monospace font, or a Pango font name
+palette       = "auto"
+scrollback    = 10000
+linger_ms     = 0
+on_exit       = "close"                  # when the session ends: close the window | search (back to the box)
+close_on_focus_loss = false
+
+[search.terminal.keys]
+copy       = ["ctrl-shift-c"]
+paste      = ["ctrl-shift-v"]
+end        = ["ctrl-shift-w"]
+to_search  = ["ctrl-shift-n"]
+fresh      = ["ctrl-shift-t"]             # cheat code: end the session, start `run` with a new {uuid} (Cmd+T)
+zoom_in    = ["ctrl-shift-equal", "ctrl-equal"]   # Cmd+= under the terminal profile, or Ctrl+=
+zoom_out   = ["ctrl-shift-minus", "ctrl-minus"]
+zoom_reset = ["ctrl-shift-0", "ctrl-0"]
+
+# Cheat codes: typing `code` in the box opens the inline terminal running `run` at once.
+# {uuid} is a per-code id mmk keeps, so `resume` reopens the same Claude Code conversation.
+[search.codes.claude]
+code      = "@!"
+run       = "claude --session-id {uuid}"
+resume    = "claude --resume {uuid}"
+cwd       = "~"                          # or "ask": pick a folder first
+shell     = false                        # run it directly: quitting Claude Code ends the session
+env_files = { CLAUDE_CODE_OAUTH_TOKEN = "~/.config/mmk/claude-token" }   # read at spawn; missing file = unset
+
+[search.codes.shell]
+code      = "@#"
+run       = ""                           # empty: an interactive shell
+
+[search.files]
+enabled        = true
+roots          = ["~"]
+exclude        = [".git", "node_modules", "target", ".cache", "__pycache__", ".venv", "~/.local/share/Trash", "~/snap"]
+hidden         = false
+respect_ignore = true
+max_watches    = 200000
+rescan_minutes = 30
+
+[search.calc]
+enabled = true
 
 # --- app profiles: first match wins; `class` globs match WM_CLASS / app id, case-insensitive ---
 
