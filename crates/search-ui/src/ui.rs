@@ -305,7 +305,15 @@ fn request(st: &St, m: Msg) {
     let startup = m.get("token").or(m.get("startup-id")).map(String::from);
     match m.verb.as_str() {
         "toggle" => {
-            if st.borrow().visible {
+            let (visible, active) = {
+                let s = st.borrow();
+                (s.visible, s.w.window.is_active())
+            };
+            if visible && !active {
+                // Still up after focus moved elsewhere (the terminal stays on focus loss):
+                // the hotkey brings it back to the front, like Spotlight; the next one hides.
+                refocus(st);
+            } else if visible {
                 hide(st);
             } else {
                 show(st, m.get("query"), startup);
@@ -423,6 +431,18 @@ fn connect(st: &St) {
             hide(&st2);
         }
     });
+    // The WM doesn't hand an override-redirect window the keyboard when it is clicked.
+    let click = gtk::GestureClick::new();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let st2 = st.clone();
+    click.connect_pressed(move |_, _, _, _| {
+        let active = st2.borrow().w.window.is_active();
+        if !active {
+            refocus(&st2);
+        }
+    });
+    w.window.add_controller(click);
+
     let st2 = st.clone();
     w.window.connect_close_request(move |_| {
         hide(&st2);
@@ -566,6 +586,30 @@ fn take_focus(st: &St) {
         }
         if tries.get() > 100 { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
     });
+}
+
+/// Take the keyboard back while shown, and remember the window it came from: that one gets
+/// it back on hide.
+fn refocus(st: &St) {
+    {
+        let mut s = st.borrow_mut();
+        if let Some(x) = &s.x11 {
+            s.previous = x.active_window();
+        }
+    }
+    take_focus(st);
+    let (term, entry, terminal) = {
+        let s = st.borrow();
+        (s.session.as_ref().map(|x| x.term.clone()), s.w.entry.clone(), s.mode == Mode::Terminal)
+    };
+    match term {
+        Some(t) if terminal => {
+            t.grab_focus();
+        }
+        _ => {
+            entry.grab_focus();
+        }
+    }
 }
 
 fn hide(st: &St) {
