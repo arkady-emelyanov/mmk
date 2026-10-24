@@ -499,7 +499,12 @@ fn show(st: &St, query: Option<&str>, startup: Option<String>) {
     if focus_term && let Some(t) = term {
         t.grab_focus();
     } else {
-        st.borrow().w.entry.grab_focus();
+        let entry = st.borrow().w.entry.clone();
+        entry.grab_focus();
+        // Focus selects the entry's text: keep that only for a restored query.
+        if query.is_some() {
+            entry.set_position(-1);
+        }
     }
 }
 

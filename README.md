@@ -66,6 +66,8 @@ The step is skipped if you already have access. That happens, for example, when 
 
 ## Search
 
+![The search window: "fire" finds Firefox as the top hit, then more apps, commands and files](docs/img/search.png)
+
 Press the hotkey and a search box appears centered on the screen; type, and results appear below it: apps (including executables and AppImages in `~/Apps` and `~/Applications`), commands on your `$PATH`, files and folders in your home, and calculator answers (`2^10`, `5 km to mi`, `0xff to decimal`). What you pick often ranks higher next time.
 
 The hotkey is not bound by default. Add a rule for it, any trigger you like:

@@ -1,6 +1,6 @@
 [package]
 name = "mmk-common"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 description = "Shared by mmk and mmk-search-ui: key names and chords, the [search] config, the pipe protocol"
 
