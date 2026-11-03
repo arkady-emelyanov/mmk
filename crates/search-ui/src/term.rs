@@ -73,9 +73,27 @@ pub fn new_terminal(cfg: &TermCfg, dark: bool) -> vte4::Terminal {
     t.set_font(Some(&pango::FontDescription::from_string(&monospace_font(&cfg.font))));
     t.set_clear_background(false);
     let fg = if dark { gdk::RGBA::new(0.88, 0.88, 0.88, 1.0) } else { gdk::RGBA::new(0.13, 0.13, 0.13, 1.0) };
-    t.set_colors(Some(&fg), Some(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)), &[]);
+    let palette: Vec<gdk::RGBA> = (if dark { &DARK } else { &LIGHT }).iter().map(|&c| rgb(c)).collect();
+    let palette: Vec<&gdk::RGBA> = palette.iter().collect();
+    t.set_colors(Some(&fg), Some(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)), &palette);
     t.add_css_class("mmk-term");
     t
+}
+
+/// The 16 ANSI colors. VTE's default is xterm's, whose blue (#0000cd) is unreadable on a
+/// dark background; these are VS Code's, readable on the box's own background.
+const DARK: [u32; 16] = [
+    0x000000, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, //
+    0x666666, 0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff,
+];
+const LIGHT: [u32; 16] = [
+    0x000000, 0xcd3131, 0x00bc00, 0x949800, 0x0451a5, 0xbc05bc, 0x0598bc, 0x555555, //
+    0x666666, 0xcd3131, 0x14ce14, 0xb5ba00, 0x0451a5, 0xbc05bc, 0x0598bc, 0xa5a5a5,
+];
+
+fn rgb(c: u32) -> gdk::RGBA {
+    let ch = |shift: u32| ((c >> shift) & 0xff) as f32 / 255.0;
+    gdk::RGBA::new(ch(16), ch(8), ch(0), 1.0)
 }
 
 /// `auto`: the desktop's monospace font, else "Monospace 11".

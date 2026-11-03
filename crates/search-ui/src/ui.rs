@@ -153,6 +153,11 @@ fn build(cfg: &SearchConfig, composited: bool) -> Widgets {
     column.append(&scroller);
     let term_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).visible(false).build();
     term_box.add_css_class("mmk-term-box");
+    // A grip in the strip above the terminal: that strip (and the rest of the frame) drags
+    // the window. Not a target, so a press on it lands on the frame.
+    let grip = gtk::Box::builder().width_request(36).height_request(4).halign(gtk::Align::Center).margin_top(10).margin_bottom(10).can_target(false).build();
+    grip.add_css_class("mmk-grip");
+    term_box.append(&grip);
     let panel = gtk::Overlay::builder().child(&column).overflow(gtk::Overflow::Hidden).halign(gtk::Align::Center).valign(gtk::Align::Start).build();
     panel.add_overlay(&term_box);
     panel.set_measure_overlay(&term_box, false);
@@ -188,7 +193,8 @@ window.mmk:not(.mmk-composited) .mmk-panel { border-radius: 0; box-shadow: none;
 .mmk-group { font-size: 0.8em; font-weight: bold; opacity: 0.55; padding: 8px 10px 2px 10px; }
 .mmk-detail { font-size: 0.85em; opacity: 0.65; }
 .mmk-calc { font-size: 1.6em; font-weight: bold; }
-.mmk-term-box { padding: 10px 12px; }
+.mmk-term-box { padding: 0 12px 10px 12px; }
+.mmk-grip { background-color: alpha(@theme_fg_color, 0.25); border-radius: 2px; }
 .mmk-term { background: transparent; }
 ";
 
@@ -442,6 +448,45 @@ fn connect(st: &St) {
         }
     });
     w.window.add_controller(click);
+
+    // The terminal's frame (the grip strip on top, the padding elsewhere) moves the window. The X window is
+    // override-redirect, so it is moved here, by shifting the anchor; the next show
+    // computes the anchor afresh and opens centered again.
+    w.term_box.set_cursor_from_name(Some("move"));
+    let drag = gtk::GestureDrag::new();
+    let from = Rc::new(std::cell::Cell::new(None::<((i32, i32), (i32, i32))>));
+    let (st2, from2) = (st.clone(), from.clone());
+    drag.connect_drag_begin(move |g, x, y| {
+        let s = st2.borrow();
+        let on_frame = s.w.term_box.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|p| &p == s.w.term_box.upcast_ref::<gtk::Widget>());
+        if !on_frame {
+            g.set_state(gtk::EventSequenceState::Denied);
+            return;
+        }
+        if let Some(xc) = &s.x11 {
+            if let (Some(p), Some(a)) = (xc.pointer(), s.anchor) {
+                from2.set(Some((p, a)));
+                g.set_state(gtk::EventSequenceState::Claimed);
+            }
+        } else if let (Some(tl), Some(dev), Some(pt)) = (s.w.window.surface().and_downcast::<gdk::Toplevel>(), g.device(), s.w.term_box.compute_point(&s.w.window, &gtk::graphene::Point::new(x as f32, y as f32))) {
+            // Elsewhere (Wayland) the compositor moves it.
+            tl.begin_move(&dev, g.current_button() as i32, pt.x() as f64, pt.y() as f64, g.current_event_time());
+            g.set_state(gtk::EventSequenceState::Denied);
+        }
+    });
+    let (st2, from2) = (st.clone(), from.clone());
+    drag.connect_drag_update(move |_, _, _| {
+        let Some(((px, py), (ax, ay))) = from2.get() else { return };
+        let width = {
+            let mut s = st2.borrow_mut();
+            let Some((nx, ny)) = s.x11.as_ref().and_then(|x| x.pointer()) else { return };
+            s.anchor = Some((ax + nx - px, ay + ny - py));
+            s.w.panel.width()
+        };
+        place(&st2, width);
+    });
+    drag.connect_drag_end(move |_, _, _| from.set(None));
+    w.term_box.add_controller(drag);
 
     let st2 = st.clone();
     w.window.connect_close_request(move |_| {

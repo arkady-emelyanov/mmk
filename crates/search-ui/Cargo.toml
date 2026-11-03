@@ -1,6 +1,6 @@
 [package]
 name = "mmk-search-ui"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2024"
 description = "mmk's Spotlight-style search window (GTK4), run and supervised by mmk"
 

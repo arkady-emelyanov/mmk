@@ -90,7 +90,7 @@ Without an Apple keyboard, or to use a desktop shortcut instead, bind the comman
 | `Cmd+1` … `Cmd+9` | open the Nth result |
 | `Esc` | close |
 
-**Terminal in the box.** A query starting with `>` is a shell line (`> ls ~/Downloads | wc -l`), and `Enter` on a command runs it too: the box grows into a terminal running it. Inside it Cmd works as in other terminals (`Cmd+C` / `Cmd+V` copy and paste, `Cmd+=` / `Cmd+-` zoom), `Cmd+W` ends the session, and `Cmd+N` goes back to the search box while the session keeps running. When the program exits the window closes (`[search.terminal] on_exit = "search"` returns to the box instead).
+**Terminal in the box.** A query starting with `>` is a shell line (`> ls ~/Downloads | wc -l`), and `Enter` on a command runs it too: the box grows into a terminal running it. Inside it Cmd works as in other terminals (`Cmd+C` / `Cmd+V` copy and paste, `Cmd+=` / `Cmd+-` zoom), `Cmd+W` ends the session, and `Cmd+N` goes back to the search box while the session keeps running. When the program exits the window closes (`[search.terminal] on_exit = "search"` returns to the box instead). Drag the strip above the terminal to move the window; the next time it opens, it is centered again.
 
 **Cheat codes.** Typing a code opens the terminal at once, with no `Enter`:
 
