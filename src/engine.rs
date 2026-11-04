@@ -23,6 +23,9 @@ pub trait Typist: Send {
     fn layout_proof(&mut self, key: u16, c: char) -> Option<(u16, bool)>;
     /// The keymap changed under us: put the characters back.
     fn refresh(&mut self);
+    /// Select a layout group that types Latin letters, if the active one doesn't; `false`
+    /// goes back to the group it replaced.
+    fn latin(&mut self, on: bool);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +96,8 @@ pub struct Engine {
     /// Search requests go here (to the supervisor); never blocks.
     pub search: Box<dyn FnMut(SearchCall) + Send>,
     typist: Option<Box<dyn Typist>>,
+    /// The typist has a Latin layout group selected, until Cmd goes up.
+    latin: bool,
     pub verbose: bool,
 }
 
@@ -118,6 +123,7 @@ impl Engine {
             exec: Box::new(|_| {}),
             search: Box::new(|_| {}),
             typist: None,
+            latin: false,
             verbose: false,
         }
     }
@@ -319,6 +325,16 @@ impl Engine {
         self.bare = [false; 2];
         self.switcher = false;
         self.cmd_down_at = None;
+        self.leave_latin();
+    }
+
+    fn leave_latin(&mut self) {
+        if self.latin {
+            self.latin = false;
+            if let Some(t) = self.typist.as_mut() {
+                t.latin(false);
+            }
+        }
     }
 
     pub fn handle(&mut self, out: &mut dyn Sink, code: u16, value: i32) -> Outcome {
@@ -357,6 +373,9 @@ impl Engine {
             self.modifier(out, code, value);
         } else {
             self.key(out, code, value);
+        }
+        if !self.cmd_held() {
+            self.leave_latin();
         }
         Outcome::Continue
     }
@@ -512,6 +531,17 @@ impl Engine {
                 }
             }
             None => {
+                // Until Cmd goes up: the group mustn't change before the X server has read
+                // the key from the virtual keyboard.
+                if self.profile.cmd_latin
+                    && self.cmd_held()
+                    && !self.latin
+                    && us_char(code, false).is_some()
+                    && let Some(t) = self.typist.as_mut()
+                {
+                    t.latin(true);
+                    self.latin = true;
+                }
                 let desired = self.passthrough_mods();
                 self.sync(out, &desired, true);
                 self.press(out, code);
@@ -1004,6 +1034,50 @@ mod tests {
             c.is_ascii_alphabetic().then(|| (lookup_key("f20").unwrap() + c.is_ascii_uppercase() as u16, false))
         }
         fn refresh(&mut self) {}
+        fn latin(&mut self, _on: bool) {}
+    }
+
+    /// Records `latin` calls.
+    struct LatinTypist(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+
+    impl Typist for LatinTypist {
+        fn prepare(&mut self, _chars: &[char]) {}
+        fn key(&mut self, _c: char) -> Option<(u16, bool)> {
+            None
+        }
+        fn layout_proof(&mut self, _key: u16, _c: char) -> Option<(u16, bool)> {
+            None
+        }
+        fn refresh(&mut self) {}
+        fn latin(&mut self, on: bool) {
+            self.0.lock().unwrap().push(on);
+        }
+    }
+
+    #[test]
+    fn cmd_latin_spans_the_cmd_hold() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut t = T::with("cmd_latin = true\n[keys]\n\"cmd-left\" = \"home\"\n", "");
+        t.e.set_typist(Box::new(LatinTypist(calls.clone())));
+        // Keys only, on before the chord and once however many chords, off with Cmd.
+        assert_eq!(t.feed("+leftmeta +c -c +v -v"), "+leftctrl +c -c +v -v");
+        assert_eq!(*calls.lock().unwrap(), [true]);
+        assert_eq!(t.feed("-leftmeta"), "-leftctrl");
+        assert_eq!(*calls.lock().unwrap(), [true, false]);
+        // Not for rules, plain typing or non-character keys.
+        calls.lock().unwrap().clear();
+        t.feed("+c -c +leftmeta +left -left +f4 -f4 -leftmeta");
+        assert!(calls.lock().unwrap().is_empty());
+        // Off in other profiles; a stuck hold ends with release_all.
+        let mut t = T::with("", "");
+        t.e.set_typist(Box::new(LatinTypist(calls.clone())));
+        t.feed("+leftmeta +c -c -leftmeta");
+        assert!(calls.lock().unwrap().is_empty());
+        let mut t = T::with("cmd_latin = true\n", "");
+        t.e.set_typist(Box::new(LatinTypist(calls.clone())));
+        t.feed("+leftmeta +c");
+        t.e.release_all(&mut Rec::default());
+        assert_eq!(*calls.lock().unwrap(), [true, false]);
     }
 
     #[test]

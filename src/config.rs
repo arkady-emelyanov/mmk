@@ -94,6 +94,8 @@ pub struct Profile {
     /// Letters, digits and punctuation in rule outputs type their US character whatever the
     /// active layout.
     pub us_keys: bool,
+    /// Cmd+key without a rule goes out with a Latin layout group selected.
+    pub cmd_latin: bool,
     /// Trigger id -> action; global rules already merged in.
     pub rules: HashMap<u32, Arc<Action>>,
 }
@@ -173,6 +175,7 @@ struct RawApp {
     raw: bool,
     cmd: Option<String>,
     us_keys: Option<bool>,
+    cmd_latin: Option<bool>,
     #[serde(default)]
     keys: HashMap<String, String>,
 }
@@ -182,6 +185,7 @@ struct RawApp {
 struct RawConfig {
     cmd: Option<String>,
     us_keys: Option<bool>,
+    cmd_latin: Option<bool>,
     alt_guard: Option<String>,
     cmd_tap: Option<String>,
     cmd_tap_ms: Option<u64>,
@@ -239,6 +243,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
     // Settings: user value, else the default config's value.
     let cmd = user.cmd.or(def.cmd).expect("default: cmd");
     let us_keys = user.us_keys.or(def.us_keys).expect("default: us_keys");
+    let cmd_latin = user.cmd_latin.or(def.cmd_latin).expect("default: cmd_latin");
     let alt_guard = user.alt_guard.or(def.alt_guard).expect("default: alt_guard");
     let cmd_tap = user.cmd_tap.or(def.cmd_tap).expect("default: cmd_tap");
     let cmd_tap_ms = user.cmd_tap_ms.or(def.cmd_tap_ms).expect("default: cmd_tap_ms");
@@ -297,6 +302,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
         raw: false,
         cmd: parse_mods(&cmd).map_err(|e| format!("cmd: {e}"))?,
         us_keys,
+        cmd_latin,
         rules: base_rules.clone(),
     });
 
@@ -314,6 +320,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
             raw: a.raw,
             cmd,
             us_keys: a.us_keys.unwrap_or(us_keys),
+            cmd_latin: a.cmd_latin.unwrap_or(cmd_latin),
             rules,
         }));
     }
@@ -445,6 +452,8 @@ mod tests {
         assert!(!c.base.us_keys);
         assert!(c.apps.iter().find(|a| a.name == "terminal").unwrap().us_keys);
         assert!(!c.apps.iter().find(|a| a.name == "browser").unwrap().us_keys);
+        assert!(!c.base.cmd_latin);
+        assert!(c.apps.iter().find(|a| a.name == "vscode").unwrap().cmd_latin);
     }
 
     #[test]

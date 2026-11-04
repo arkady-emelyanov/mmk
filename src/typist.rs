@@ -10,7 +10,8 @@
 //! recently used one is remapped on demand) or the keymap was reset under us.
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, Mapping, PropMode, Window};
+use x11rb::protocol::xkb::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, Mapping, ModMask, PropMode, Window};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -22,6 +23,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const NO_SYMBOL: u32 = 0;
 const PROPERTY: &[u8] = b"_MMK_BORROWED_KEYCODES";
+/// `XkbUseCoreKbd`.
+const CORE_KBD: xkb::DeviceSpec = 0x100;
+/// The keycode of the A key, which is a Latin letter in any Latin layout.
+const KEYCODE_A: u8 = 38;
 
 /// Evdev codes never borrowed, even if the X keymap leaves them empty: keys that the
 /// kernel, logind or the session may act on below X.
@@ -77,6 +82,10 @@ pub struct X11Typist {
     stale: bool,
     /// Evdev codes of US character keys that type something else in some layout group.
     varies: Vec<u16>,
+    /// The first layout group that types Latin letters, and which groups do.
+    latin_groups: Vec<bool>,
+    /// The group `latin` replaced, and the one it selected.
+    swapped: Option<(u8, u8)>,
 }
 
 impl X11Typist {
@@ -90,7 +99,19 @@ impl X11Typist {
         for kc in prev.value32().into_iter().flatten().filter_map(|kc| u8::try_from(kc).ok()) {
             conn.change_keyboard_mapping(1, kc, 2, &[NO_SYMBOL; 2])?;
         }
-        Ok(X11Typist { conn, root, prop, slots: Vec::new(), wanted: Vec::new(), tick: 0, stale: false, varies: Vec::new() })
+        conn.xkb_use_extension(1, 0)?.reply()?;
+        Ok(X11Typist {
+            conn,
+            root,
+            prop,
+            slots: Vec::new(),
+            wanted: Vec::new(),
+            tick: 0,
+            stale: false,
+            varies: Vec::new(),
+            latin_groups: Vec::new(),
+            swapped: None,
+        })
     }
 
     /// Re-read the keymap: drop borrowed keycodes something else took, borrow newly free
@@ -106,6 +127,12 @@ impl X11Typist {
 
         // The core keymap lists every group's keysyms for a key: a key types its US character
         // in every layout if nothing but that character (and its Shift pair) appears.
+        // Each group holds two levels of a letter key, in group order.
+        self.latin_groups = syms(KEYCODE_A)
+            .chunks_exact(2)
+            .map(|levels| u8::try_from(levels[0]).is_ok_and(|k| k.is_ascii_lowercase()))
+            .collect();
+
         self.varies = (min.max(9)..=max)
             .map(|kc| kc as u16 - 8)
             .filter(|&code| {
@@ -228,6 +255,34 @@ impl X11Typist {
         self.try_key(c)
     }
 
+    fn lock_group(&self, group: u8) -> Result<(), BoxError> {
+        let none = ModMask::from(0u16);
+        let group = xkb::Group::from(group);
+        self.conn.xkb_latch_lock_state(CORE_KBD, none, none, true, group, none, false, 0)?;
+        Ok(())
+    }
+
+    fn try_latin(&mut self, on: bool) -> Result<(), BoxError> {
+        let now = self.conn.xkb_get_state(CORE_KBD)?.reply()?.locked_group;
+        let now = u8::from(now);
+        if on {
+            let is_latin = |g: u8| self.latin_groups.get(g as usize).copied().unwrap_or(false);
+            let target = self.latin_groups.iter().position(|l| *l).map(|g| g as u8);
+            if let (false, Some(target), None) = (is_latin(now), target, self.swapped) {
+                self.lock_group(target)?;
+                self.swapped = Some((now, target));
+            }
+        } else if let Some((old, target)) = self.swapped.take() {
+            // Unless the user switched layout in the meantime.
+            if now == target {
+                self.lock_group(old)?;
+            }
+        }
+        // Applied before the key that follows reaches the server.
+        self.conn.get_input_focus()?.reply()?;
+        Ok(())
+    }
+
     fn try_key(&mut self, c: char) -> Result<Option<(u16, bool)>, BoxError> {
         self.drain_events()?;
         if self.stale {
@@ -279,6 +334,12 @@ impl Typist for X11Typist {
         let r = self.drain_events().and_then(|_| self.refresh());
         if let Err(e) = r {
             eprintln!("mmk: restoring characters in the X keymap: {e}");
+        }
+    }
+
+    fn latin(&mut self, on: bool) {
+        if let Err(e) = self.try_latin(on) {
+            eprintln!("mmk: switching layout group: {e}");
         }
     }
 }
@@ -364,6 +425,35 @@ mod tests {
             let map = conn.get_keyboard_mapping(kc, 1).unwrap().reply().unwrap();
             assert!(map.keysyms.iter().all(|k| *k == NO_SYMBOL), "keycode {kc} left mapped: {:x?}", map.keysyms);
         }
+    }
+
+    /// Against an X server with us,ru,us groups (a nested one: this switches layout):
+    /// `DISPLAY=:9 cargo test -- --ignored x11_latin`
+    #[test]
+    #[ignore]
+    fn x11_latin() {
+        let mut t = X11Typist::connect().unwrap();
+        t.prepare(&[]);
+        assert_eq!(t.latin_groups[..3], [true, false, true]);
+        let group = |t: &X11Typist| u8::from(t.conn.xkb_get_state(CORE_KBD).unwrap().reply().unwrap().locked_group);
+        t.lock_group(1).unwrap();
+        t.conn.get_input_focus().unwrap().reply().unwrap();
+        t.latin(true);
+        assert_eq!(group(&t), 0);
+        t.latin(false);
+        assert_eq!(group(&t), 1);
+        // A layout switch during the hold is kept; an already Latin group is left alone.
+        t.latin(true);
+        t.lock_group(2).unwrap();
+        t.conn.get_input_focus().unwrap().reply().unwrap();
+        t.latin(false);
+        assert_eq!(group(&t), 2);
+        t.latin(true);
+        assert_eq!(group(&t), 2);
+        t.latin(false);
+        assert_eq!(group(&t), 2);
+        t.lock_group(0).unwrap();
+        t.conn.get_input_focus().unwrap().reply().unwrap();
     }
 
     /// Against the running X server: keys that type other characters in some layout group

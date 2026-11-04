@@ -165,6 +165,7 @@ name  = "terminal"
 class = ["kitty", "org.gnome.terminal", "*ghostty*"]  # globs, case-insensitive
 cmd   = "ctrl-shift"         # Cmd+key without a rule becomes Ctrl+Shift+key here
 us_keys = true               # rule outputs like alt-b type their US character in any layout
+cmd_latin = false            # Cmd+key is sent with a Latin layout group selected
 [app.keys]
 "opt-left" = "alt-b"
 
@@ -177,6 +178,8 @@ raw   = true                 # pass keys through untouched (VMs, remote desktops
 ### Non-Latin layouts
 
 A rule sends key positions, and the active layout decides what they type: with a Russian layout active, the terminal's `Opt+←` = `alt-b` arrives as `Alt+и`, which readline ignores. With `us_keys = true` (on for the default terminal profile; set it at the top for every app), letters, digits and punctuation in rule outputs type their US character whatever the layout, through a spare keycode as in Typography. Keys that type the same in all your layouts are sent as they are. Other apps don't need it: they match `Ctrl`/`Alt` shortcuts by key position. Works on X11 only.
+
+VS Code's terminal is an exception. With a Russian layout, it tells apps that use the kitty keyboard protocol (such as Claude Code) that `Ctrl+C` is `Ctrl+с`, and they ignore it; plain key positions don't help, and VS Code ignores keycodes remapped while it runs, so `us_keys` can't either. `cmd_latin = true` (on for the default VS Code profile) selects a Latin layout group from the first `Cmd+key` until `Cmd` is released, so your layout indicator may blink. Keys without a rule are covered, physical `Ctrl` isn't. Works on X11 only.
 
 ### Finding an app's WM_CLASS
 

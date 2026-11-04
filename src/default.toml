@@ -17,6 +17,7 @@
 # --- settings ---
 cmd            = "ctrl"                  # what Cmd becomes for keys without a rule
 us_keys        = false                   # letters, digits and punctuation in rule outputs type their US character in any layout (X11)
+cmd_latin      = false                   # Cmd+key is sent with a Latin layout group selected, so apps see the key's Latin letter (X11)
 alt_guard      = "none"                  # key tapped before releasing a lone Alt, e.g. "f19", to stop Opt taps focusing menu bars; "none" = plain Alt taps
 cmd_tap        = "none"                  # action when Cmd is pressed and released alone, e.g. "super" (pass a lone Cmd through as Super)
 cmd_tap_ms     = 250                     # max Cmd hold time that still counts as a tap
@@ -265,6 +266,7 @@ us_keys = true                           # Alt+B stays Alt+B (readline) when a R
 [[app]]
 name  = "vscode"
 class = ["code", "com.microsoft.vscode*", "code - oss", "code-oss", "cursor", "vscodium", "windsurf"]
+cmd_latin = true                         # its terminal reports Ctrl+с under a Russian layout to apps using the kitty keyboard protocol
 [app.keys]
 "cmd-opt-up"   = "ctrl-shift-up"
 "cmd-opt-down" = "ctrl-shift-down"

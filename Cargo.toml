@@ -1,13 +1,13 @@
 [package]
 name = "mmk"
-version = "1.4.3"
+version = "1.5.0"
 edition = "2024"
 description = "Mac-style keyboard remapper for Apple keyboards on Linux"
 
 [dependencies]
 mmk-common = { path = "crates/common" }
 libc = "0.2"
-x11rb = "0.14"
+x11rb = { version = "0.14", features = ["xkb"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 lexopt = "0.3"
