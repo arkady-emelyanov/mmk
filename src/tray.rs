@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ksni::blocking::TrayMethods;
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
@@ -26,44 +28,71 @@ pub struct Tray {
 
 pub type Handle = ksni::blocking::Handle<Tray>;
 
-pub fn spawn(tx: Sender<Msg>, config_path: PathBuf, remapping: bool) -> Option<Handle> {
-    let fresh = match install_icons() {
-        Ok(changed) => changed,
-        Err(e) => {
-            eprintln!("mmk: tray icons: {e}");
-            false
-        }
-    };
-    let t = Tray {
-        enabled: true,
-        profile: "global".into(),
-        app: String::new(),
-        keyboards: Vec::new(),
-        error: None,
-        search: None,
-        remapping,
-        config_path,
-        // Panels notice new icon files only after their next periodic rescan; until then
-        // show the pixmap, then switch to the named icon so the panel looks it up again.
-        named_icon: !fresh,
-        tx,
-    };
-    match t.spawn() {
-        Ok(h) => {
-            if fresh {
-                let h2 = h.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(8));
-                    h2.update(|t| t.named_icon = true);
-                });
+/// The tray, once it has registered with the panel.
+pub type Slot = Arc<Mutex<Option<Handle>>>;
+
+/// Total time to keep retrying when the panel's tray isn't up yet (at login it can start
+/// after us).
+const RETRY_FOR: Duration = Duration::from_secs(10);
+
+/// Waits between attempts: 250 ms, doubling, until `RETRY_FOR` has been spent waiting.
+fn backoff() -> impl Iterator<Item = Duration> {
+    let mut left = RETRY_FOR;
+    std::iter::successors(Some(Duration::from_millis(250)), |d| Some(*d * 2)).map_while(move |d| {
+        let d = d.min(left);
+        left -= d;
+        (!d.is_zero()).then_some(d)
+    })
+}
+
+/// Registers the tray in the background, retrying with backoff; the slot fills on success
+/// and `Msg::TrayReady` follows so the caller can push the current state.
+pub fn spawn(tx: Sender<Msg>, config_path: PathBuf, remapping: bool) -> Slot {
+    let slot = Slot::default();
+    let s = slot.clone();
+    std::thread::spawn(move || {
+        let fresh = match install_icons() {
+            Ok(changed) => changed,
+            Err(e) => {
+                eprintln!("mmk: tray icons: {e}");
+                false
             }
-            Some(h)
+        };
+        let mut waits = backoff();
+        let h = loop {
+            let t = Tray {
+                enabled: true,
+                profile: "global".into(),
+                app: String::new(),
+                keyboards: Vec::new(),
+                error: None,
+                search: None,
+                remapping,
+                config_path: config_path.clone(),
+                // Panels notice new icon files only after their next periodic rescan; until then
+                // show the pixmap, then switch to the named icon so the panel looks it up again.
+                named_icon: !fresh,
+                tx: tx.clone(),
+            };
+            match t.spawn() {
+                Ok(h) => break h,
+                Err(e) => match waits.next() {
+                    Some(d) => std::thread::sleep(d),
+                    None => {
+                        eprintln!("mmk: no tray: {e}");
+                        return;
+                    }
+                },
+            }
+        };
+        *s.lock().unwrap() = Some(h.clone());
+        let _ = tx.send(Msg::TrayReady);
+        if fresh {
+            std::thread::sleep(Duration::from_secs(8));
+            h.update(|t| t.named_icon = true);
         }
-        Err(e) => {
-            eprintln!("mmk: no tray: {e}");
-            None
-        }
-    }
+    });
+    slot
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -385,6 +414,16 @@ fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_doubles_and_stops_at_ten_seconds() {
+        let waits: Vec<_> = super::backoff().collect();
+        let ms: Vec<_> = waits.iter().map(Duration::as_millis).collect();
+        assert_eq!(ms, [250, 500, 1000, 2000, 4000, 2250]);
+        assert_eq!(waits.iter().sum::<Duration>(), super::RETRY_FOR);
+    }
+
     #[test]
     #[ignore]
     fn dump_icons() {

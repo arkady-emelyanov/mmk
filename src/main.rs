@@ -46,6 +46,8 @@ pub enum Msg {
     SearchStatus(Option<search::Status>),
     /// Tray menu: toggle the search window.
     SearchToggle,
+    /// The tray registered with the panel (possibly after retries); push the current state.
+    TrayReady,
     Quit,
 }
 
@@ -274,7 +276,7 @@ fn run(args: &Args) -> i32 {
         mgr
     });
 
-    let tray = if cfg.tray { tray::spawn(tx.clone(), args.config.clone(), remapping) } else { None };
+    let tray = if cfg.tray { tray::spawn(tx.clone(), args.config.clone(), remapping) } else { tray::Slot::default() };
     let search = search::Supervisor::start(tx.clone(), cfg.search.clone(), args.verbose);
 
     let mut engine = Engine::new(cfg.clone());
@@ -296,7 +298,7 @@ fn run(args: &Args) -> i32 {
     let mut search_status: Option<search::Status> = None;
 
     let update_tray = |engine: &Engine, app: &str, error: &Option<String>, search_error: &Option<String>, search_status: &Option<search::Status>| {
-        if let Some(h) = &tray {
+        if let Some(h) = &*tray.lock().unwrap() {
             // Config errors and current device problems; device problems vanish with the device.
             let mut errors: Vec<String> = error.iter().cloned().collect();
             errors.extend(search_error.iter().map(|e| format!("Config error (search): {e}")));
@@ -339,7 +341,7 @@ fn run(args: &Args) -> i32 {
                 }
                 Outcome::Continue
             }
-            Msg::DevicesChanged => {
+            Msg::DevicesChanged | Msg::TrayReady => {
                 update_tray(&engine, &app, &error, &search_error, &search_status);
                 Outcome::Continue
             }
