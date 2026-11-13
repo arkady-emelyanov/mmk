@@ -8,8 +8,14 @@
 //! next start. Everything is mapped when the config loads; a key press only looks the
 //! character up, unless there are more characters than free keycodes (then the least
 //! recently used one is remapped on demand) or the keymap was reset under us.
+//!
+//! mmk outlives its X server when the session restarts (a logout, a display manager
+//! restart), so a lost connection is reopened on next use and the characters mapped again.
+
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, Mapping, ModMask, PropMode, Window};
 use x11rb::protocol::Event;
@@ -27,6 +33,10 @@ const PROPERTY: &[u8] = b"_MMK_BORROWED_KEYCODES";
 const CORE_KBD: xkb::DeviceSpec = 0x100;
 /// The keycode of the A key, which is a Latin letter in any Latin layout.
 const KEYCODE_A: u8 = 38;
+
+/// The least time between attempts to reopen a lost X connection, so a key press while
+/// no X server is up costs one failed connect at most this often.
+const RECONNECT_EVERY: Duration = Duration::from_secs(1);
 
 /// Evdev codes never borrowed, even if the X keymap leaves them empty: keys that the
 /// kernel, logind or the session may act on below X.
@@ -86,6 +96,8 @@ pub struct X11Typist {
     latin_groups: Vec<bool>,
     /// The group `latin` replaced, and the one it selected.
     swapped: Option<(u8, u8)>,
+    /// The last attempt to reopen a lost connection.
+    reconnected: Option<Instant>,
 }
 
 impl X11Typist {
@@ -111,7 +123,29 @@ impl X11Typist {
             varies: Vec::new(),
             latin_groups: Vec::new(),
             swapped: None,
+            reconnected: None,
         })
+    }
+
+    /// Run `f`; if it fails because the X server went away, open a new connection, map the
+    /// characters on it, and run `f` again.
+    fn retrying<T>(&mut self, f: impl Fn(&mut Self) -> Result<T, BoxError>) -> Result<T, BoxError> {
+        match f(self) {
+            Err(e) if is_disconnect(&*e) => {
+                if self.reconnected.is_some_and(|t| t.elapsed() < RECONNECT_EVERY) {
+                    return Err(e);
+                }
+                self.reconnected = Some(Instant::now());
+                let mut new = X11Typist::connect()?;
+                new.try_prepare(&self.wanted)?;
+                new.reconnected = self.reconnected;
+                // The old one's Drop can't reach its server; nothing to return there.
+                *self = new;
+                eprintln!("mmk: reconnected to the X server for typing characters");
+                f(self)
+            }
+            r => r,
+        }
     }
 
     /// Re-read the keymap: drop borrowed keycodes something else took, borrow newly free
@@ -304,7 +338,7 @@ impl X11Typist {
 
 impl Typist for X11Typist {
     fn prepare(&mut self, chars: &[char]) {
-        if let Err(e) = self.try_prepare(chars) {
+        if let Err(e) = self.retrying(|t| t.try_prepare(chars)) {
             eprintln!("mmk: mapping characters into the X keymap: {e}");
         }
         let mapped = chars.iter().filter(|c| self.find(**c).is_some()).count();
@@ -317,28 +351,27 @@ impl Typist for X11Typist {
     }
 
     fn key(&mut self, c: char) -> Option<(u16, bool)> {
-        self.try_key(c).unwrap_or_else(|e| {
+        self.retrying(|t| t.try_key(c)).unwrap_or_else(|e| {
             eprintln!("mmk: typing {c:?}: {e}");
             None
         })
     }
 
     fn layout_proof(&mut self, key: u16, c: char) -> Option<(u16, bool)> {
-        self.try_layout_proof(key, c).unwrap_or_else(|e| {
+        self.retrying(|t| t.try_layout_proof(key, c)).unwrap_or_else(|e| {
             eprintln!("mmk: typing {c:?} layout-independently: {e}");
             None
         })
     }
 
     fn refresh(&mut self) {
-        let r = self.drain_events().and_then(|_| self.refresh());
-        if let Err(e) = r {
+        if let Err(e) = self.retrying(|t| t.drain_events().and_then(|_| t.refresh())) {
             eprintln!("mmk: restoring characters in the X keymap: {e}");
         }
     }
 
     fn latin(&mut self, on: bool) {
-        if let Err(e) = self.try_latin(on) {
+        if let Err(e) = self.retrying(|t| t.try_latin(on)) {
             eprintln!("mmk: switching layout group: {e}");
         }
     }
@@ -346,29 +379,54 @@ impl Typist for X11Typist {
 
 /// Call `changed` whenever the X keymap changes, on a thread of its own. A burst of changes
 /// (a desktop applying a layout to a new keyboard, or our own writes) is reported once,
-/// after it settles.
+/// after it settles. If the X server goes away, the thread reconnects to the next one and
+/// reports that as a change, since its keymap knows nothing of our characters.
 pub fn watch(changed: impl Fn() + Send + 'static) {
     // Connected before returning, so no change made after this call is missed.
     let Ok((conn, _)) = x11rb::connect(None) else { return };
     std::thread::spawn(move || {
-        let keyboard = |ev: &Event| matches!(ev, Event::MappingNotify(e) if e.request == Mapping::KEYBOARD);
-        while let Ok(ev) = conn.wait_for_event() {
-            if !keyboard(&ev) {
-                continue;
-            }
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let mut more = false;
-                while let Ok(Some(ev)) = conn.poll_for_event() {
-                    more |= keyboard(&ev);
+        let mut conn = Some(conn);
+        loop {
+            let c = match conn.take() {
+                Some(c) => c,
+                None => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let Ok((c, _)) = x11rb::connect(None) else { continue };
+                    changed();
+                    c
                 }
-                if !more {
-                    break;
-                }
-            }
-            changed();
+            };
+            watch_until_closed(&c, &changed);
         }
     });
+}
+
+fn watch_until_closed(conn: &RustConnection, changed: &impl Fn()) {
+    let keyboard = |ev: &Event| matches!(ev, Event::MappingNotify(e) if e.request == Mapping::KEYBOARD);
+    while let Ok(ev) = conn.wait_for_event() {
+        if !keyboard(&ev) {
+            continue;
+        }
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut more = false;
+            while let Ok(Some(ev)) = conn.poll_for_event() {
+                more |= keyboard(&ev);
+            }
+            if !more {
+                break;
+            }
+        }
+        changed();
+    }
+}
+
+/// Whether `e` means the connection to the X server is gone (as opposed to the server
+/// refusing a request).
+fn is_disconnect(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.is::<ConnectionError>()
+        || matches!(e.downcast_ref::<ReplyError>(), Some(ReplyError::ConnectionError(_)))
+        || matches!(e.downcast_ref::<ReplyOrIdError>(), Some(ReplyOrIdError::ConnectionError(_)))
 }
 
 impl Drop for X11Typist {
