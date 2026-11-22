@@ -3,8 +3,13 @@
 //!
 //! One index thread does all the writing: walks (ignore's parallel walker, whose threads only
 //! stat, add watches and send), inotify events (each marks its folder dirty; dirty folders are
-//! re-listed and reconciled), periodic rescans of folders left without a watch, and the cache.
+//! re-listed and reconciled), periodic polls of folders left without a watch, and the cache.
 //! Readers take the store's read lock briefly.
+//!
+//! inotify watches are a per-user resource shared with every other program, so only a small
+//! budget of them is used, on the folders likeliest to change: shallow ones and recently
+//! modified ones. Every other folder is polled: a `stat` each, and a re-listing only when its
+//! mtime moved (adding, removing or renaming a child updates a folder's mtime).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString};
@@ -38,7 +43,17 @@ const NOTIFY_GAP: Duration = Duration::from_millis(200);
 const NOTIFY_GAP_SCANNING: Duration = Duration::from_secs(1);
 /// Events are collected this long before the dirty folders are re-listed.
 const SETTLE: Duration = Duration::from_millis(100);
-const SAVE_EVERY: Duration = Duration::from_secs(300);
+/// The cache is also saved on exit, so this only bounds what a crash loses.
+const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+/// Watch budget: at most this share of `fs.inotify.max_user_watches`, whatever the config says.
+const WATCH_SHARE: usize = 16;
+/// Folders this shallow below a root, or modified this recently, are worth a watch.
+const WATCH_DEPTH: usize = 2;
+const WATCH_RECENT: u32 = 30 * 24 * 3600;
+/// Ids added since the consumer last took them; past this, it reloads everything instead.
+const ADDED_MAX: usize = 1 << 20;
+/// Folders `stat`ed per read lock by a poll.
+const POLL_CHUNK: usize = 4096;
 /// Items applied per write lock during a walk.
 const BATCH: usize = 4096;
 /// Entries copied out per read lock by `for_each`.
@@ -73,8 +88,9 @@ struct Entry {
 
 const _: () = assert!(mem::size_of::<Entry>() == 24);
 
-/// The arena. Ids are indexes into `e`; freed ids are reused, but only after the next
-/// `on_change` (`pending` -> `free`), so a stale id never names another file unannounced.
+/// The arena. Ids are indexes into `e`; freed ids are reused, but not before the walk that freed
+/// them ends (`pending` -> `free`), as a walk's bookkeeping still holds them. A consumer can hold
+/// a stale id that now names another entry: it must resolve ids to their current name and path.
 #[derive(Default)]
 struct Store {
     e: Vec<Entry>,
@@ -85,6 +101,10 @@ struct Store {
     live: usize,
     free: Vec<u32>,
     pending: Vec<u32>,
+    /// Ids inserted since the consumer last took them (`FileIndex::take_added`), unless
+    /// `added_overflow`: then it has to reload everything.
+    added: Vec<u32>,
+    added_overflow: bool,
     /// Open-addressing table (linear probing) of non-root ids, keyed by (parent, name).
     slots: Vec<u32>,
     used: usize,
@@ -198,6 +218,13 @@ impl Store {
         if parent != NONE {
             self.at_mut(parent).child = id;
             self.live += 1;
+            if !self.added_overflow {
+                self.added.push(id);
+                if self.added.len() > ADDED_MAX {
+                    self.added_overflow = true;
+                    self.added = Vec::new();
+                }
+            }
             if (self.used + 1) * 10 > self.slots.len() * 7 {
                 self.rebuild_table();
             } else {
@@ -299,6 +326,29 @@ impl Store {
         self.path_bytes(id, false).map(|b| PathBuf::from(OsString::from_vec(b)))
     }
 
+    /// Renumber the live entries densely, dropping freed slots. Only before anyone holds ids.
+    fn repack(&mut self) {
+        let mut map = vec![NONE; self.e.len()];
+        let mut n = 0;
+        for (i, x) in self.e.iter().enumerate() {
+            if x.kind != FREE {
+                map[i] = n;
+                n += 1;
+            }
+        }
+        let m = |x: u32| if x == NONE { NONE } else { map[x as usize] };
+        let mut e = Vec::with_capacity(n as usize);
+        for x in self.e.iter().filter(|x| x.kind != FREE) {
+            e.push(Entry { parent: m(x.parent), child: m(x.child), next: m(x.next), ..*x });
+        }
+        self.e = e;
+        self.roots = self.roots.iter().map(|&r| m(r)).collect();
+        self.free.clear();
+        self.pending.clear();
+        self.compact();
+        self.rebuild_table();
+    }
+
     fn compact(&mut self) {
         let mut names = Vec::with_capacity(self.names.len() - self.garbage);
         for x in &mut self.e {
@@ -384,7 +434,11 @@ impl Store {
             let id = roots.iter().copied().find(|&id| st.name(id) == r.as_os_str().as_bytes()).ok_or_else(bad)?;
             st.roots.push(id);
         }
-        st.rebuild_table();
+        if st.free.len() > 65536 && st.free.len() > st.live / 4 {
+            st.repack();
+        } else {
+            st.rebuild_table();
+        }
         Ok(st)
     }
 }
@@ -496,6 +550,26 @@ impl Scope {
         let name = path.file_name().map_or(&[][..], |n| n.as_bytes());
         self.names.iter().any(|g| glob(g, name)) || self.prefixes.iter().any(|p| path.starts_with(p))
     }
+
+    /// Whether a folder deserves one of the few watches: near a root, or recently modified.
+    fn watch_worthy(&self, path: &Path, mtime: u32) -> bool {
+        mtime.saturating_add(WATCH_RECENT) >= now_secs()
+            || self.roots.iter().any(|r| path.strip_prefix(r).is_ok_and(|rel| rel.components().count() <= WATCH_DEPTH))
+    }
+}
+
+fn now_secs() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
+}
+
+fn mtime_of(m: &fs::Metadata) -> u32 {
+    m.mtime().clamp(0, u32::MAX as i64) as u32
+}
+
+/// The watch budget: the configured one, capped at a share of the per-user limit.
+fn watch_budget(configured: usize) -> usize {
+    let system = fs::read_to_string("/proc/sys/fs/inotify/max_user_watches").ok().and_then(|s| s.trim().parse::<usize>().ok());
+    system.map_or(configured, |n| configured.min(n / WATCH_SHARE))
 }
 
 /// What `status` reports (and `mmk doctor` shows).
@@ -543,16 +617,18 @@ struct Watcher {
     ino: i32,
     max: usize,
     sh: Arc<Shared>,
+    /// Watches added by the walk filter, for the visitor to pick up (the filter runs before the
+    /// folder is listed, the visitor after, and only the visitor reports to the index thread).
+    added: Mutex<HashMap<PathBuf, i32>>,
 }
 
 impl Watcher {
-    /// Watch a folder; its watch descriptor, or -1 (no inotify, over the limit, error).
+    /// Watch a folder; its watch descriptor, or -1 (no inotify, over the budget, error).
     fn add(&self, path: &Path) -> i32 {
         if self.ino < 0 {
             return -1;
         }
         if self.sh.watches.load(Relaxed) >= self.max {
-            self.sh.limit_hit.store(true, Relaxed);
             return -1;
         }
         let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return -1 };
@@ -610,12 +686,13 @@ struct Item {
 struct Visit {
     tx: mpsc::SyncSender<Vec<Item>>,
     w: Arc<Watcher>,
+    scope: Arc<Scope>,
     buf: Vec<Item>,
 }
 
 impl<'s> ParallelVisitorBuilder<'s> for Visit {
     fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
-        Box::new(Visit { tx: self.tx.clone(), w: self.w.clone(), buf: Vec::new() })
+        Box::new(Visit { tx: self.tx.clone(), w: self.w.clone(), scope: self.scope.clone(), buf: Vec::new() })
     }
 }
 
@@ -630,9 +707,16 @@ impl ParallelVisitor for Visit {
             Some(t) if t.is_file() => FILE,
             _ => OTHER,
         };
-        let mtime = e.metadata().map_or(0, |m| m.mtime().clamp(0, u32::MAX as i64) as u32);
-        let wd = if kind == DIR { self.w.add(e.path()) } else { -1 };
+        let mtime = e.metadata().map_or(0, |m| mtime_of(&m));
         let depth = e.depth();
+        let wd = match kind {
+            // A walk's own targets don't pass the filter. Already watched: the watch stays bound.
+            DIR if depth == 0 => {
+                if self.scope.watch_worthy(e.path(), mtime) { self.w.add(e.path()) } else { -1 }
+            }
+            DIR => self.w.added.lock().unwrap().remove(e.path()).unwrap_or(-1),
+            _ => -1,
+        };
         self.buf.push(Item { path: e.into_path(), depth, kind, mtime, wd });
         if kind == DIR || self.buf.len() >= 256 {
             self.flush();
@@ -656,17 +740,23 @@ impl Drop for Visit {
 }
 
 /// Walker filter, for entries below a walk's roots: `exclude`, other filesystems. Folders that
-/// stay are watched here, before the walker lists them, so nothing created meanwhile is missed.
+/// stay and deserve a watch get it here, before the walker lists them, so nothing created
+/// meanwhile is missed.
 fn keep(scope: &Scope, w: &Watcher, e: &DirEntry) -> bool {
     if scope.excluded(e.path()) {
         return false;
     }
     if e.file_type().is_some_and(|t| t.is_dir()) {
-        let dev = |p: &Path| fs::symlink_metadata(p).map(|m| m.dev()).ok();
-        if dev(e.path()) != e.path().parent().and_then(dev) {
+        let Ok(m) = fs::symlink_metadata(e.path()) else { return false };
+        if Some(m.dev()) != e.path().parent().and_then(|p| fs::symlink_metadata(p).ok()).map(|p| p.dev()) {
             return false;
         }
-        w.add(e.path());
+        if scope.watch_worthy(e.path(), mtime_of(&m)) {
+            let wd = w.add(e.path());
+            if wd >= 0 {
+                w.added.lock().unwrap().insert(e.path().to_path_buf(), wd);
+            }
+        }
     }
     true
 }
@@ -706,8 +796,11 @@ struct Indexer {
     on_change: Box<dyn Fn() + Send + Sync>,
     wd_id: HashMap<i32, u32>,
     id_wd: HashMap<u32, i32>,
-    /// Folders without a watch (over `max_watches`), re-listed every `rescan`.
+    /// Folders without a watch, polled every `rescan`.
     unwatched: HashSet<u32>,
+    /// Wall-clock second the previous poll (or full scan) started: a folder modified since then
+    /// may have changed again within the same second, after it was listed.
+    polled_at: u32,
     dirty: HashSet<u32>,
     dirty_since: Option<Instant>,
     overflow: bool,
@@ -754,8 +847,15 @@ impl Indexer {
                 break;
             }
             self.drain();
-            if self.overflow || self.sh.reindex.swap(false, Relaxed) {
+            if self.sh.reindex.swap(false, Relaxed) {
                 self.full_scan();
+            } else if self.overflow {
+                // Events were lost, but only watched folders send any: re-list those.
+                self.overflow = false;
+                self.dirty.clear();
+                self.dirty_since = None;
+                let t = self.targets(self.id_wd.keys().copied().collect::<Vec<_>>());
+                self.scan(t, false);
             } else if self.dirty_since.is_some_and(|t| t.elapsed() >= SETTLE) {
                 self.dirty_since = None;
                 let ids = mem::take(&mut self.dirty);
@@ -764,8 +864,7 @@ impl Indexer {
             }
             if !self.unwatched.is_empty() && Instant::now() >= self.next_rescan {
                 self.next_rescan = Instant::now() + self.scope.rescan;
-                let t = self.targets(self.unwatched.iter().copied().collect::<Vec<_>>());
-                self.scan(t, false);
+                self.poll();
             }
             self.notify();
             if self.cache_dirty && self.last_save.elapsed() >= SAVE_EVERY {
@@ -783,7 +882,33 @@ impl Indexer {
         ids.into_iter().filter(|&id| st.is_dir(id)).filter_map(|id| Some((id, st.path(id)?))).collect()
     }
 
+    /// Re-list the unwatched folders whose mtime moved since they were listed.
+    fn poll(&mut self) {
+        let since = mem::replace(&mut self.polled_at, now_secs());
+        let ids: Vec<u32> = self.unwatched.iter().copied().collect();
+        let mut moved = Vec::new();
+        for chunk in ids.chunks(POLL_CHUNK) {
+            if self.sh.stop.load(Relaxed) {
+                return;
+            }
+            let dirs: Vec<(u32, PathBuf, u32)> = {
+                let st = self.sh.store.read().unwrap();
+                chunk.iter().filter(|&&id| st.is_dir(id)).filter_map(|&id| Some((id, st.path(id)?, st.at(id).mtime))).collect()
+            };
+            for (id, path, known) in dirs {
+                // Gone: its parent's mtime moved, and the parent's listing drops it.
+                let Ok(m) = fs::symlink_metadata(&path) else { continue };
+                let now = mtime_of(&m);
+                if now != known || now.saturating_add(2) >= since {
+                    moved.push((id, path));
+                }
+            }
+        }
+        self.scan(moved, false);
+    }
+
     fn full_scan(&mut self) {
+        self.polled_at = now_secs();
         self.overflow = false;
         self.dirty.clear();
         self.dirty_since = None;
@@ -832,6 +957,7 @@ impl Indexer {
         let (scope, w) = (self.scope.clone(), self.w.clone());
         b.filter_entry(move |e| keep(&scope, &w, e));
         let walk = b.build_parallel();
+        let scope = self.scope.clone();
         let mut dirs: HashMap<PathBuf, u32> = targets.into_iter().map(|(id, p)| (p, id)).collect();
         let mut wk = Walked::default();
         let (tx, rx) = mpsc::sync_channel::<Vec<Item>>(256);
@@ -841,7 +967,7 @@ impl Indexer {
         thread::scope(|s| {
             s.spawn(move || {
                 lower_priority(true);
-                walk.visit(&mut Visit { tx, w, buf: Vec::new() });
+                walk.visit(&mut Visit { tx, w, scope, buf: Vec::new() });
             });
             while let Ok(first) = rx.recv() {
                 if sh.stop.load(Relaxed) {
@@ -895,10 +1021,17 @@ impl Indexer {
         let fresh = self.targets(mem::take(&mut wk.fresh));
         self.scan(fresh, true);
         self.nesting -= 1;
+        let mut st = sh.store.write().unwrap();
         if self.nesting == 0 {
             sh.scanning.store(false, Relaxed);
+            // The walk's bookkeeping is gone: freed ids can be reused.
+            let p = mem::take(&mut st.pending);
+            st.free.extend(p);
+            // Watches the filter added for folders the walk never visited.
+            for (_, wd) in self.w.added.lock().unwrap().drain() {
+                unsafe { libc::inotify_rm_watch(self.w.ino, wd) };
+            }
         }
-        let mut st = sh.store.write().unwrap();
         if st.garbage > 1 << 20 && st.garbage * 2 > st.names.len() {
             st.compact();
         }
@@ -1077,8 +1210,9 @@ impl FileIndex {
         let now = Instant::now();
         let ix = Indexer {
             sh: sh.clone(),
-            w: Arc::new(Watcher { ino, max: scope.max_watches, sh: sh.clone() }),
+            w: Arc::new(Watcher { ino, max: watch_budget(scope.max_watches), sh: sh.clone(), added: Mutex::new(HashMap::new()) }),
             next_rescan: now + scope.rescan,
+            polled_at: now_secs(),
             scope: Arc::new(scope),
             cache,
             on_change,
@@ -1134,9 +1268,59 @@ impl FileIndex {
         }
     }
 
+    /// Forget the ids added so far: call before reading everything with `for_each`. An id added
+    /// meanwhile can then be both read and taken later, never neither.
+    pub fn reset_added(&self) {
+        let mut st = self.0.store.write().unwrap();
+        st.added = Vec::new();
+        st.added_overflow = false;
+    }
+
+    /// Visit the entries added since the last call (or `reset_added`), as `for_each` does.
+    /// False, visiting nothing, if too many were added to keep track: reload everything instead.
+    /// An entry freed since is skipped; a reused id shows its current entry.
+    pub fn take_added(&self, mut f: impl FnMut(u32, &str, bool)) -> bool {
+        let ids = {
+            let mut st = self.0.store.write().unwrap();
+            if mem::take(&mut st.added_overflow) {
+                st.added = Vec::new();
+                return false;
+            }
+            mem::take(&mut st.added)
+        };
+        let (mut buf, mut items) = (String::new(), Vec::new());
+        for chunk in ids.chunks(CHUNK) {
+            buf.clear();
+            items.clear();
+            {
+                let st = self.0.store.read().unwrap();
+                for &id in chunk {
+                    let Some(e) = st.e.get(id as usize) else { continue };
+                    if e.kind == FREE || e.parent == NONE {
+                        continue;
+                    }
+                    let a = buf.len();
+                    buf.push_str(&String::from_utf8_lossy(st.name(id)));
+                    items.push((id, a, buf.len(), e.kind == DIR));
+                }
+            }
+            for &(id, a, b, dir) in &items {
+                f(id, &buf[a..b], dir);
+            }
+        }
+        true
+    }
+
     /// Full path of an id, if it still exists in the index.
+    #[cfg(test)]
     pub fn path(&self, id: u32) -> Option<PathBuf> {
         self.0.store.read().unwrap().path(id)
+    }
+
+    /// Full path of an id and whether it is a folder, if it still exists in the index.
+    pub fn entry(&self, id: u32) -> Option<(PathBuf, bool)> {
+        let st = self.0.store.read().unwrap();
+        Some((st.path(id)?, st.is_dir(id)))
     }
 
     /// Path relative to its root ("Projects/mmk/src").
@@ -1286,6 +1470,71 @@ mod tests {
     }
 
     #[test]
+    fn store_repack() {
+        let mut s = Store::new(&[PathBuf::from("/r")]);
+        let r = s.roots[0];
+        let d = s.insert(r, b"d", DIR, 0);
+        let ids: Vec<u32> = (0..100).map(|i| s.insert(d, format!("f{i}").as_bytes(), FILE, 7)).collect();
+        let mut gone = Vec::new();
+        s.retain_children(d, |c| c % 3 == 0, &mut gone);
+        let live = s.live;
+        s.repack();
+        assert_eq!(s.live, live);
+        assert_eq!(s.e.len(), live + 1);
+        assert!(s.free.is_empty() && s.pending.is_empty() && s.garbage == 0);
+        assert_eq!(s.path(s.roots[0]).unwrap(), Path::new("/r"));
+        for (i, &id) in ids.iter().enumerate() {
+            let d = s.find(s.roots[0], b"d").unwrap();
+            let f = s.find(d, format!("f{i}").as_bytes());
+            assert_eq!(f.is_some(), id % 3 == 0, "f{i}");
+            if let Some(f) = f {
+                assert_eq!(s.path(f).unwrap(), PathBuf::from(format!("/r/d/f{i}")));
+                assert_eq!(s.at(f).mtime, 7);
+            }
+        }
+    }
+
+    #[test]
+    fn watches_go_to_shallow_and_recent_folders() {
+        let t = Tmp::new();
+        let r = t.0.join("root");
+        put(&r, "a/b/old/deep/f.txt");
+        put(&r, "a/b/new/deep/f.txt");
+        let year_ago = std::time::SystemTime::now() - Duration::from_secs(365 * 24 * 3600);
+        for d in ["a/b/old/deep", "a/b/old"] {
+            File::open(r.join(d)).unwrap().set_modified(year_ago).unwrap();
+        }
+        let scope = Scope::new(&files(&r, |_| {}));
+        let at = |d: &str| mtime_of(&fs::metadata(r.join(d)).unwrap());
+        assert!(scope.watch_worthy(&r.join("a/b"), 0), "shallow");
+        assert!(!scope.watch_worthy(&r.join("a/b/old"), at("a/b/old")), "deep and old");
+        assert!(scope.watch_worthy(&r.join("a/b/new"), at("a/b/new")), "recent");
+        let ix = Ix::start(&files(&r, |_| {}), &t.0.join("files.idx")).ready();
+        // root, a, a/b, a/b/new, a/b/new/deep.
+        assert_eq!(ix.ix.status().watches, 5);
+        // The old folders are polled: a change still shows up.
+        put(&r, "a/b/old/deep/g.txt");
+        wait("poll", || ix.has("a/b/old/deep/g.txt"));
+    }
+
+    #[test]
+    fn added_ids_are_tracked() {
+        let t = Tmp::new();
+        let r = t.0.join("root");
+        put(&r, "a.txt");
+        let ix = Ix::start(&files(&r, |_| {}), &t.0.join("files.idx")).ready();
+        ix.ix.reset_added();
+        put(&r, "d/b.txt");
+        let mut got = BTreeMap::new();
+        wait("added", || {
+            assert!(ix.ix.take_added(|id, name, dir| _ = got.insert(name.to_string(), (id, dir))));
+            got.contains_key("b.txt")
+        });
+        assert!(got["d"].1 && !got["b.txt"].1 && !got.contains_key("a.txt"), "{got:?}");
+        assert_eq!(ix.ix.entry(got["b.txt"].0).unwrap().0, r.join("d/b.txt"));
+    }
+
+    #[test]
     fn scope_rules() {
         let t = Tmp::new();
         let r = &t.0;
@@ -1410,9 +1659,9 @@ mod tests {
         }
         let ix = Ix::start(&files(&r, |c| c.max_watches = 2), &t.0.join("files.idx")).ready();
         let s = ix.ix.status();
-        assert!(s.watch_limit_hit && s.watches <= 2, "{s:?}");
+        assert!(s.watches <= 2, "{s:?}");
         assert_eq!(s.entries, 10);
-        // Unwatched folders are re-listed every `rescan` (300 ms here).
+        // Unwatched folders are polled every `rescan` (300 ms here); their mtimes moved.
         for i in 0..5 {
             put(&r, &format!("d{i}/new/g.txt"));
         }

@@ -1,5 +1,6 @@
 //! Files and folders (§16.6.3): the index's names matched on nucleo's worker threads.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,34 +22,56 @@ pub struct Files {
     pub stale: Arc<AtomicBool>,
     query: String,
     matcher: Matcher,
+    /// Items pushed into nucleo since its last restart, freed ones included.
+    injected: usize,
 }
 
 impl Files {
     pub fn new(index: FileIndex, stale: Arc<AtomicBool>) -> Files {
         let nucleo = Nucleo::new(nucleo::Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
-        let mut f = Files { index, nucleo, stale, query: String::new(), matcher: Matcher::new(nucleo::Config::DEFAULT.match_paths()) };
+        let mut f = Files { index, nucleo, stale, query: String::new(), matcher: Matcher::new(nucleo::Config::DEFAULT.match_paths()), injected: 0 };
         f.reload();
         f
     }
 
-    /// Re-inject every entry (after the index changed).
+    /// Re-inject every entry.
     pub fn reload(&mut self) {
         self.stale.store(false, Ordering::Relaxed);
         self.nucleo.restart(true);
+        self.index.reset_added();
         let inj = self.nucleo.injector();
+        let mut n = 0;
         self.index.for_each(|id, name, dir| {
             inj.push((id, dir), |_, cols| cols[0] = name.into());
+            n += 1;
         });
+        self.injected = n;
         let q = std::mem::take(&mut self.query);
         self.set_query(&q);
+    }
+
+    /// Catch up with the index: inject what it added. Freed entries stay in nucleo and are
+    /// dropped by `rows`; once they pile up (or the additions weren't tracked), reload.
+    fn sync(&mut self) {
+        self.stale.store(false, Ordering::Relaxed);
+        let inj = self.nucleo.injector();
+        let mut n = 0;
+        let tracked = self.index.take_added(|id, name, dir| {
+            inj.push((id, dir), |_, cols| cols[0] = name.into());
+            n += 1;
+        });
+        self.injected += n;
+        let live = self.index.status().entries;
+        if !tracked || self.injected > live + live / 4 + 65536 {
+            self.reload();
+        }
     }
 
     /// The last path segment is matched against names; earlier segments must appear, in order,
     /// in the path relative to its root (`mmk/src` finds `~/Projects/mmk/src`).
     pub fn set_query(&mut self, q: &str) {
         if self.stale.load(Ordering::Relaxed) {
-            self.query = q.to_string();
-            return self.reload();
+            self.sync();
         }
         let last = q.trim().trim_end_matches('/').rsplit('/').next().unwrap_or("");
         let append = !self.query.is_empty() && q.starts_with(&self.query) && !q.contains('/');
@@ -61,7 +84,8 @@ impl Files {
         self.nucleo.tick(ms).running
     }
 
-    /// The best matches as rows, with comparable fuzzy scores.
+    /// The best matches as rows, with comparable fuzzy scores. An item's id is resolved to its
+    /// current entry and rescored by its current name: the item may be freed, or its id reused.
     pub fn rows(&mut self) -> Vec<Row> {
         let q = self.query.trim().trim_end_matches('/').to_string();
         if q.is_empty() {
@@ -77,12 +101,16 @@ impl Files {
         let home = crate::home();
         let mut buf = Vec::new();
         let mut out = Vec::new();
+        let mut ids = HashSet::new();
         for item in snap.matched_items(0..n) {
             if out.len() >= CANDIDATES {
                 break;
             }
-            let (id, dir) = *item.data;
-            let Some(path) = self.index.path(id) else { continue };
+            let id = item.data.0;
+            if !ids.insert(id) {
+                continue;
+            }
+            let Some((path, dir)) = self.index.entry(id) else { continue };
             if !dirs.is_empty() {
                 let rel = self.index.rel_path(id).unwrap_or_default().to_lowercase();
                 if !in_order(&rel, &dirs) {
