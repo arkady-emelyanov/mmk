@@ -208,8 +208,8 @@ roots          = ["~"]
 exclude        = [".git", "node_modules", "target", ".cache", "__pycache__", ".venv", "~/.local/share/Trash", "~/snap"]
 hidden         = false
 respect_ignore = true
-max_watches    = 200000
-rescan_minutes = 30
+max_watches    = 8192
+rescan_minutes = 10
 
 [search.calc]
 enabled = true
